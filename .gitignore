@@ -7,3 +7,9 @@ experiments/results/*.json
 # local envs
 .venv/
 venv/
+
+# experiments intermediate
+results/
+logs/
+cases/
+*.png
