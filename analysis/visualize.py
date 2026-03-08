@@ -38,8 +38,8 @@ def parse_args() -> argparse.Namespace:
         "--plot",
         type=str,
         default="throughput",
-        choices=["loss", "throughput", "comm", "memory", "theory-memory"],
-        help="Plot type: per-step loss, throughput, comm, measured peak memory, or theoretical memory",
+        choices=["loss", "throughput", "comm", "stage-throughput", "stage-comm", "memory", "theory-memory"],
+        help="Plot type: per-step loss, bandwidth sweep throughput/comm, stage comparison throughput/comm, measured peak memory, or theoretical memory",
     )
     parser.add_argument("--output", type=str, default="analysis/figures/week3_plot.png")
     parser.add_argument("--model-size", type=str, default="", help="Optional filter for one model size")
@@ -151,14 +151,14 @@ def _representative_cases_by_stage(cases: Iterable[CaseView]) -> List[CaseView]:
 
 def _case_peak_memory_mb(case: CaseView) -> float | None:
     cuda_candidates = [
-        case.peak_cuda_max_reserved_mb,
-        case.peak_cuda_max_allocated_mb,
-        case.peak_cuda_reserved_mb,
         case.peak_cuda_allocated_mb,
+        case.peak_cuda_max_allocated_mb,
+        case.peak_cuda_max_reserved_mb,
+        case.peak_cuda_reserved_mb,
     ]
     positive_cuda = [value for value in cuda_candidates if value is not None and value > 0.0]
     if positive_cuda:
-        return max(positive_cuda)
+        return positive_cuda[0]
     return case.peak_host_rss_mb
 
 
@@ -251,6 +251,46 @@ def plot_bandwidth_metric(cases: List[CaseView], metric: str, output: Path) -> N
     plt.savefig(output)
 
 
+def plot_stage_metric(cases: List[CaseView], metric: str, output: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for visualization: pip install matplotlib") from exc
+
+    metric_key = "mean_tokens_per_s" if metric == "stage-throughput" else "mean_comm_ms"
+    ylabel = "Tokens / s" if metric == "stage-throughput" else "Mean communication ms / step"
+    title = "Throughput by ZeRO Stage" if metric == "stage-throughput" else "Communication by ZeRO Stage"
+    color = "#1E6D5A" if metric == "stage-throughput" else "#B05D2B"
+
+    selected = _representative_cases_by_stage(case for case in cases if case.return_code == 0)
+    if not selected:
+        raise RuntimeError("No successful cases available for stage comparison plotting")
+
+    points = []
+    for case in selected:
+        value = getattr(case, metric_key)
+        if value is None:
+            continue
+        points.append((case.stage, value))
+
+    if not points:
+        raise RuntimeError(f"No metric data available for plot '{metric}'")
+
+    points.sort(key=lambda item: item[0])
+    stages = [stage for stage, _value in points]
+    values = [value for _stage, value in points]
+
+    plt.figure(figsize=(7, 4.5))
+    plt.bar(stages, values, color=color)
+    plt.xticks(stages, [f"stage {stage}" for stage in stages])
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True, axis="y", alpha=0.3)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output)
+
+
 def plot_peak_memory(cases: List[CaseView], output: Path) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -329,6 +369,10 @@ def main() -> None:
         plot_bandwidth_metric(cases=cases, metric="throughput", output=out)
     elif args.plot == "comm":
         plot_bandwidth_metric(cases=cases, metric="comm", output=out)
+    elif args.plot == "stage-throughput":
+        plot_stage_metric(cases=cases, metric="stage-throughput", output=out)
+    elif args.plot == "stage-comm":
+        plot_stage_metric(cases=cases, metric="stage-comm", output=out)
     elif args.plot == "memory":
         plot_peak_memory(cases=cases, output=out)
     else:
