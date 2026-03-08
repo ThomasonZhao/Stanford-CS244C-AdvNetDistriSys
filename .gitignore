@@ -13,4 +13,6 @@ experiments/results/*
 experiments/configs/*
 analysis/figures/*
 
+# bundle files
+*.tar.gz
 
