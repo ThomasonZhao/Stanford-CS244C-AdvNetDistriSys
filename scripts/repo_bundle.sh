@@ -100,10 +100,9 @@ do_unpack() {
   local tmpdir
   tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/repo_unpack.XXXXXX")"
 
-  cleanup() {
-    rm -rf -- "$tmpdir"
-  }
-  trap cleanup EXIT
+  local quoted_tmpdir
+  printf -v quoted_tmpdir '%q' "$tmpdir"
+  trap "rm -rf -- $quoted_tmpdir" EXIT
 
   tar -tzf "$archive" >/dev/null || die "Invalid tar.gz archive: $archive"
   tar -xzf "$archive" -C "$tmpdir"
