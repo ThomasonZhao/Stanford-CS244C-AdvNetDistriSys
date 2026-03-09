@@ -195,6 +195,26 @@ python3 analysis/visualize.py \
 
 Validate applied throttling with `iperf3` before collecting data.
 
+For a reproducible `tc` + `iperf3` check, run an iperf server on the peer host:
+
+```bash
+python3 scripts/validate_bandwidth.py server --bind 0.0.0.0 --port 5201
+```
+
+Then run the validation from the client host:
+
+```bash
+python3 scripts/validate_bandwidth.py validate \
+  --target-host <peer-ip> \
+  --port 5201 \
+  --device eth0 \
+  --rate 10gbit \
+  --duration-s 5 \
+  --json-output /tmp/tc_validation.json
+```
+
+This script records baseline throughput, applies `tc`, measures shaped throughput, clears `tc`, and fails if the shaped bandwidth does not drop enough. Use two hosts or two VMs connected through the interface you plan to shape; traffic to the local machine's own IP will typically route through `lo` and is not a meaningful `eth0` validation. In containers, root may still be insufficient if the runtime does not grant `CAP_NET_ADMIN`.
+
 ## Communication Interface Contract
 
 ZeRO wrappers treat communication as a black box:

@@ -14,7 +14,7 @@ import torch.distributed as dist
 
 from collectives import LocalCollectives, SendRecvCollectives, TorchCollectives
 from model import LlamaForCausalLM, build_config, estimate_num_parameters, human_readable_count
-from profiler import MemoryTracker, TimerRegistry
+from profiler import MemoryTracker, TimerRegistry, overlap_efficiency
 from train import batch_from_chunk, make_data_loader, set_seed
 from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
 
@@ -327,6 +327,8 @@ def train(args: argparse.Namespace) -> None:
         iter_ms = iter_timer.stop()
         step_time = iter_ms / 1000.0
         tokens_per_second = global_tokens_per_step / max(step_time, 1e-8)
+        compute_ms = max(iter_ms - comm_ms, 0.0)
+        overlap_ratio = overlap_efficiency(step_ms=iter_ms, compute_ms=compute_ms, communication_ms=comm_ms)
 
         if rank == 0 and (step % args.log_interval == 0 or step == 1 or step == args.max_steps):
             avg_loss = sum(recent_losses) / len(recent_losses)
@@ -349,6 +351,7 @@ def train(args: argparse.Namespace) -> None:
                     "communication_ms": comm_ms,
                     "optimizer_ms": float(step_stats["optim_ms"]),
                     "iteration_ms": iter_ms,
+                    "overlap_ratio": overlap_ratio,
                 }
             )
 
@@ -380,16 +383,36 @@ def train(args: argparse.Namespace) -> None:
         state_memory_breakdown_mb = None
         if hasattr(engine, "memory_state_breakdown_mb"):
             state_memory_breakdown_mb = engine.memory_state_breakdown_mb()
+        overlap_summary = None
+        if step_profiles:
+            overlap_values = [float(step["overlap_ratio"]) for step in step_profiles]
+            overlap_summary = {
+                "mean": float(sum(overlap_values) / len(overlap_values)),
+                "min": float(min(overlap_values)),
+                "max": float(max(overlap_values)),
+            }
         profile_payload = {
             "rank": rank,
             "world_size": world_size,
             "stage": args.zero_stage,
             "collective_impl": args.collective_impl,
             "args": vars(args),
+            "model_config": cfg.to_dict(),
+            "optimizer_config": {
+                "lr": args.learning_rate,
+                "betas": [args.beta1, args.beta2],
+                "eps": args.eps,
+                "weight_decay": args.weight_decay,
+                "max_grad_norm": args.max_grad_norm,
+            },
+            "global_batch_size": args.batch_size * args.grad_accum_steps * world_size,
+            "microbatch_size_per_gpu": args.batch_size,
+            "overlap_enabled": False,
             "timers": timer_payload,
             "memory": memory.as_dicts() if should_record_memory else [],
             "steps": step_profiles,
             "state_memory_breakdown_mb": state_memory_breakdown_mb,
+            "overlap_summary": overlap_summary,
         }
 
         profile_path = Path(args.profile_json)

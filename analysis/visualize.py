@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
         "--plot",
         type=str,
         default="throughput",
-        choices=["loss", "throughput", "comm", "stage-throughput", "stage-comm", "memory", "peak-memory"],
-        help="Plot type: per-step loss, bandwidth sweep throughput/comm, stage comparison throughput/comm, measured state memory, or measured peak memory",
+        choices=["loss", "throughput", "comm", "stage-throughput", "grouped-stage-throughput", "stage-comm", "memory", "peak-memory"],
+        help="Plot type: per-step loss, bandwidth sweep throughput/comm, stage comparison throughput/comm, grouped model-vs-stage throughput, measured state memory, or measured peak memory",
     )
     parser.add_argument("--output", type=str, default="analysis/figures/week3_plot.png")
     parser.add_argument("--model-size", type=str, default="", help="Optional filter for one model size")
@@ -293,6 +293,45 @@ def plot_stage_metric(cases: List[CaseView], metric: str, output: Path) -> None:
     plt.savefig(output)
 
 
+def plot_grouped_stage_throughput(cases: List[CaseView], output: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for visualization: pip install matplotlib") from exc
+
+    filtered = [case for case in cases if case.return_code == 0 and case.mean_tokens_per_s is not None]
+    if not filtered:
+        raise RuntimeError("No successful cases available for grouped throughput plotting")
+
+    models = sorted({case.model_size for case in filtered})
+    stages = sorted({case.stage for case in filtered})
+    width = 0.8 / max(len(models), 1)
+    x_positions = list(range(len(stages)))
+
+    plt.figure(figsize=(8.5, 5))
+    for model_index, model_size in enumerate(models):
+        heights = []
+        for stage in stages:
+            candidates = [case for case in filtered if case.model_size == model_size and case.stage == stage]
+            if not candidates:
+                heights.append(0.0)
+                continue
+            chosen = _representative_cases_by_stage(candidates)[0]
+            heights.append(float(chosen.mean_tokens_per_s))
+
+        offsets = [x + (model_index - (len(models) - 1) / 2.0) * width for x in x_positions]
+        plt.bar(offsets, heights, width=width, label=model_size)
+
+    plt.xticks(x_positions, [f"stage {stage}" for stage in stages])
+    plt.ylabel("Tokens / s")
+    plt.title("Throughput by ZeRO Stage and Model Size")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.legend(title="model")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output)
+
+
 def plot_measured_state_memory(cases: List[CaseView], output: Path) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -390,6 +429,8 @@ def main() -> None:
         plot_bandwidth_metric(cases=cases, metric="comm", output=out)
     elif args.plot == "stage-throughput":
         plot_stage_metric(cases=cases, metric="stage-throughput", output=out)
+    elif args.plot == "grouped-stage-throughput":
+        plot_grouped_stage_throughput(cases=cases, output=out)
     elif args.plot == "stage-comm":
         plot_stage_metric(cases=cases, metric="stage-comm", output=out)
     elif args.plot == "memory":
