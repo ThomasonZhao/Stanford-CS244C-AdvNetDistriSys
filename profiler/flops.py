@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Callable, Dict, Generic, List, Optional, TypeVar
 
 import torch
+
+if TYPE_CHECKING:
+    from model.config import ModelConfig
 
 
 T = TypeVar("T")
@@ -22,6 +25,42 @@ def flops_to_tflops_per_second(total_flops: float, step_time_s: float) -> float:
     if total_flops < 0.0 or step_time_s <= 0.0:
         raise ValueError("total_flops must be >= 0 and step_time_s must be > 0")
     return float(total_flops) / 1e12 / float(step_time_s)
+
+
+def estimate_transformer_train_flops(
+    cfg: "ModelConfig",
+    batch_size: int,
+    seq_len: int,
+    grad_accum_steps: int = 1,
+    world_size: int = 1,
+    stage: int = 0,
+) -> float:
+    if batch_size <= 0 or seq_len <= 0 or grad_accum_steps <= 0 or world_size <= 0:
+        raise ValueError("batch_size, seq_len, grad_accum_steps, and world_size must be positive")
+
+    tokens = float(batch_size * seq_len)
+    hidden = float(cfg.dim)
+    layers = float(cfg.n_layers)
+    ffn = float(cfg.ffn_dim)
+    heads = float(cfg.n_heads)
+    head_dim = float(cfg.head_dim)
+    kv_dim = float(cfg.n_kv_heads * cfg.head_dim)
+    vocab = float(cfg.vocab_size)
+
+    # Dense projection and attention kernels dominate runtime for these models.
+    attn_proj_flops = 2.0 * tokens * ((2.0 * hidden * hidden) + (2.0 * hidden * kv_dim))
+    attn_score_flops = 2.0 * float(batch_size) * heads * float(seq_len) * float(seq_len) * head_dim
+    attn_apply_flops = attn_score_flops
+    mlp_flops = 2.0 * tokens * hidden * ffn * 3.0
+    norm_and_pointwise_flops = tokens * ((8.0 * hidden) + (4.0 * ffn))
+    lm_head_flops = 2.0 * tokens * hidden * vocab
+
+    forward_flops = layers * (
+        attn_proj_flops + attn_score_flops + attn_apply_flops + mlp_flops + norm_and_pointwise_flops
+    ) + lm_head_flops
+
+    training_multiplier = 4.0 if stage == 3 else 3.0
+    return forward_flops * training_multiplier * float(grad_accum_steps * world_size)
 
 
 @dataclass

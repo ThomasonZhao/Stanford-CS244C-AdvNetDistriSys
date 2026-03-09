@@ -20,6 +20,7 @@ from model import (
     human_readable_count,
 )
 from profiler import FlopTracker, MemoryTracker, TimerRegistry, flops_to_tflops_per_second, overlap_efficiency
+from profiler import estimate_transformer_train_flops
 from train import batch_from_chunk, make_data_loader, set_seed
 from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
 
@@ -81,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-json", type=str, default="")
     parser.add_argument("--profile-memory-interval", type=int, default=0)
     parser.add_argument("--profile-rank0-only", action="store_true")
+    parser.add_argument("--tflops-mode", type=str, default="estimate", choices=["estimate", "profile", "off"])
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--verbose-memory", action="store_true")
 
@@ -115,6 +117,17 @@ def autocast_context(device: torch.device, dtype_name: str):
     if dtype_name == "float32":
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def configure_runtime(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 
 
 def broadcast_model(model: LlamaForCausalLM) -> None:
@@ -187,7 +200,8 @@ def save_checkpoint(
 
 def train(args: argparse.Namespace) -> None:
     rank, world_size, device = init_distributed()
-    verbose_enabled = args.verbose or args.max_steps <= 10
+    verbose_enabled = bool(args.verbose)
+    configure_runtime(device)
     set_seed(args.seed)
     log_event(rank, f"initialized distributed world_size={world_size} device={device} pid={os.getpid()}", force=verbose_enabled)
 
@@ -254,7 +268,7 @@ def train(args: argparse.Namespace) -> None:
     data_iter: Iterator[torch.Tensor] = iter(loader)
 
     timers = TimerRegistry(device=device)
-    flop_tracker = FlopTracker(device=device) if rank == 0 else None
+    flop_tracker = FlopTracker(device=device) if rank == 0 and args.tflops_mode == "profile" else None
     memory = MemoryTracker(device=device)
     enable_profile_output = bool(args.profile_json)
     should_record_memory = args.profile_memory_interval > 0
@@ -267,7 +281,16 @@ def train(args: argparse.Namespace) -> None:
 
     recent_losses = []
     t_train_start = time.perf_counter()
-    measured_step_flops: float | None = None
+    step_flops: float | None = None
+    if args.tflops_mode == "estimate":
+        step_flops = estimate_transformer_train_flops(
+            cfg=cfg,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            grad_accum_steps=args.grad_accum_steps,
+            world_size=world_size,
+            stage=args.zero_stage,
+        )
 
     for step in range(1, args.max_steps + 1):
         log_event(rank, f"starting step={step}/{args.max_steps}", force=verbose_enabled)
@@ -312,10 +335,10 @@ def train(args: argparse.Namespace) -> None:
                 log_event(rank, f"step={step} microbatch end loss={micro_losses_local[-1]:.4f}", force=verbose_enabled)
             return micro_losses_local
 
-        if rank == 0 and flop_tracker is not None and measured_step_flops is None:
+        if rank == 0 and flop_tracker is not None and step_flops is None:
             micro_losses, profiled_flops = flop_tracker.measure(label=f"step_{step}", fn=run_microbatches)
             if profiled_flops is not None:
-                measured_step_flops = profiled_flops
+                step_flops = profiled_flops * world_size
         else:
             micro_losses = run_microbatches()
 
@@ -346,8 +369,8 @@ def train(args: argparse.Namespace) -> None:
         step_time = iter_ms / 1000.0
         tokens_per_second = global_tokens_per_step / max(step_time, 1e-8)
         tflops_per_second = None
-        if measured_step_flops is not None:
-            tflops_per_second = flops_to_tflops_per_second(total_flops=measured_step_flops, step_time_s=step_time)
+        if step_flops is not None:
+            tflops_per_second = flops_to_tflops_per_second(total_flops=step_flops, step_time_s=step_time)
         compute_ms = max(iter_ms - comm_ms, 0.0)
         overlap_ratio = overlap_efficiency(step_ms=iter_ms, compute_ms=compute_ms, communication_ms=comm_ms)
 
@@ -435,7 +458,8 @@ def train(args: argparse.Namespace) -> None:
             "memory": memory.as_dicts() if should_record_memory else [],
             "flops": {
                 "measurements": flop_tracker.as_dicts() if flop_tracker is not None else [],
-                "profiled_step_flops": measured_step_flops,
+                "profiled_step_flops": step_flops,
+                "tflops_mode": args.tflops_mode,
             },
             "steps": step_profiles,
             "state_memory_breakdown_mb": state_memory_breakdown_mb,

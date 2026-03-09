@@ -558,8 +558,8 @@ def _build_summary(results: List[CaseResult], args: argparse.Namespace) -> Dict[
             "fp32-based, and do not include activations, temporary buffers, or framework overhead."
         ),
         "profiled_tflops_note": (
-            "Training TFLOPs/s is derived from torch.profiler operator FLOPs measured on the first successful "
-            "training step for each case and normalized by each step's iteration time."
+            "Training TFLOPs/s is derived from the train_zero TFLOPs mode: estimated cluster step FLOPs by default, "
+            "or torch.profiler-derived FLOPs when profile mode is explicitly enabled."
         ),
         "num_cases": len(results),
         "num_failures": sum(1 for r in results if r.return_code != 0),
