@@ -14,9 +14,30 @@ import torch.distributed as dist
 
 from collectives import LocalCollectives, SendRecvCollectives, TorchCollectives
 from model import LlamaForCausalLM, build_config, estimate_num_parameters, human_readable_count
-from profiler import MemoryTracker, TimerRegistry
+from profiler import MemoryTracker, TimerRegistry, overlap_efficiency
 from train import batch_from_chunk, make_data_loader, set_seed
 from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
+
+
+def log_event(rank: int, message: str, *, force: bool = True) -> None:
+    if not force:
+        return
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}][rank {rank}] {message}", flush=True)
+
+
+def format_device_memory(device: torch.device) -> str:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return "host-only"
+
+    allocated_mb = torch.cuda.memory_allocated(device) / (1024.0 * 1024.0)
+    reserved_mb = torch.cuda.memory_reserved(device) / (1024.0 * 1024.0)
+    max_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
+    return (
+        f"cuda_allocated_mb={allocated_mb:.1f} "
+        f"cuda_reserved_mb={reserved_mb:.1f} "
+        f"cuda_max_allocated_mb={max_allocated_mb:.1f}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-json", type=str, default="")
     parser.add_argument("--profile-memory-interval", type=int, default=0)
     parser.add_argument("--profile-rank0-only", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--verbose-memory", action="store_true")
 
     return parser.parse_args()
 
@@ -159,10 +182,17 @@ def save_checkpoint(
 
 def train(args: argparse.Namespace) -> None:
     rank, world_size, device = init_distributed()
+    verbose_enabled = args.verbose or args.max_steps <= 10
     set_seed(args.seed)
+    log_event(rank, f"initialized distributed world_size={world_size} device={device} pid={os.getpid()}", force=verbose_enabled)
 
     base_vocab_size = args.synthetic_vocab_size
     cfg = build_config(size=args.model_size, vocab_size=base_vocab_size, max_seq_len=args.seq_len)
+    log_event(
+        rank,
+        f"building data loader data_mode={args.data_mode} model={args.model_size} seq_len={args.seq_len} batch_size={args.batch_size}",
+        force=verbose_enabled,
+    )
 
     try:
         loader, detected_vocab_size, metadata = make_data_loader(
@@ -184,14 +214,24 @@ def train(args: argparse.Namespace) -> None:
             world_size=world_size,
         )
 
+    log_event(
+        rank,
+        f"data loader ready detected_vocab={detected_vocab_size} metadata={json.dumps(metadata)}",
+        force=verbose_enabled,
+    )
+
     if detected_vocab_size != cfg.vocab_size:
         cfg = cfg.with_vocab_size(detected_vocab_size)
 
+    log_event(rank, f"constructing model config={cfg.name}", force=verbose_enabled)
     model = LlamaForCausalLM(cfg).to(device)
+    log_event(rank, f"model moved to device {device} {format_device_memory(device)}", force=verbose_enabled or args.verbose_memory)
     broadcast_model(model)
+    log_event(rank, "model parameter broadcast complete", force=verbose_enabled)
 
     collectives = pick_collectives(world_size=world_size, impl=args.collective_impl)
     engine = build_engine(args=args, model=model, collectives=collectives)
+    log_event(rank, f"engine ready stage={args.zero_stage} impl={args.collective_impl}", force=verbose_enabled)
 
     if rank == 0:
         n_params = estimate_num_parameters(cfg)
@@ -199,8 +239,10 @@ def train(args: argparse.Namespace) -> None:
             f"[init] stage={args.zero_stage} impl={args.collective_impl} "
             f"world_size={world_size} model={cfg.name} params={human_readable_count(n_params)} ({n_params:,}) "
             f"vocab={cfg.vocab_size:,} seq_len={cfg.max_seq_len} device={device} dtype={args.dtype}"
+            ,
+            flush=True,
         )
-        print(f"[init] data_mode={args.data_mode} metadata={json.dumps(metadata)}")
+        print(f"[init] data_mode={args.data_mode} metadata={json.dumps(metadata)}", flush=True)
 
     global_tokens_per_step = args.batch_size * args.grad_accum_steps * args.seq_len * world_size
     data_iter: Iterator[torch.Tensor] = iter(loader)
@@ -214,11 +256,13 @@ def train(args: argparse.Namespace) -> None:
 
     if should_record_memory and rank_profile_enabled:
         memory.record("start")
+        log_event(rank, f"recorded memory snapshot start {format_device_memory(device)}", force=verbose_enabled or args.verbose_memory)
 
     recent_losses = []
     t_train_start = time.perf_counter()
 
     for step in range(1, args.max_steps + 1):
+        log_event(rank, f"starting step={step}/{args.max_steps}", force=verbose_enabled)
         iter_timer = timers.timer("iteration")
         iter_timer.start()
 
@@ -226,13 +270,16 @@ def train(args: argparse.Namespace) -> None:
         engine.zero_grad()
         prepare_comm_ms = 0.0
         if hasattr(engine, "prepare_forward"):
+            log_event(rank, f"step={step} prepare_forward begin", force=verbose_enabled)
             prepare_stats = engine.prepare_forward()
             prepare_comm_ms = float(prepare_stats.get("prepare_comm_ms", 0.0))
+            log_event(rank, f"step={step} prepare_forward end prepare_comm_ms={prepare_comm_ms:.2f}", force=verbose_enabled)
         fwd_bwd_timer = timers.timer("forward_backward")
         fwd_bwd_timer.start()
 
         micro_losses = []
         for _micro in range(args.grad_accum_steps):
+            log_event(rank, f"step={step} microbatch begin", force=verbose_enabled)
             try:
                 chunk = next(data_iter)
             except StopIteration:
@@ -252,15 +299,23 @@ def train(args: argparse.Namespace) -> None:
 
             micro_losses.append(float(loss.detach().float().item()))
             engine.backward(scaled_loss)
+            log_event(rank, f"step={step} microbatch end loss={micro_losses[-1]:.4f}", force=verbose_enabled)
 
         fwd_bwd_ms = fwd_bwd_timer.stop()
+        log_event(rank, f"step={step} forward_backward complete fb_ms={fwd_bwd_ms:.2f}", force=verbose_enabled)
 
         step_timer = timers.timer("optimizer_step")
         step_timer.start()
+        log_event(rank, f"step={step} optimizer step begin", force=verbose_enabled)
         step_stats = engine.step_with_stats(max_grad_norm=args.max_grad_norm)
         _ = step_timer.stop()
         grad_norm_value = float(step_stats["grad_norm"])
         comm_ms = float(step_stats["comm_ms"]) + prepare_comm_ms
+        log_event(
+            rank,
+            f"step={step} optimizer step end grad_norm={grad_norm_value:.3f} comm_ms={comm_ms:.2f} optim_ms={float(step_stats['optim_ms']):.2f}",
+            force=verbose_enabled,
+        )
 
         local_step_loss = float(sum(micro_losses) / len(micro_losses))
         step_loss = global_mean_scalar(local_step_loss, device=device, world_size=world_size)
@@ -272,6 +327,8 @@ def train(args: argparse.Namespace) -> None:
         iter_ms = iter_timer.stop()
         step_time = iter_ms / 1000.0
         tokens_per_second = global_tokens_per_step / max(step_time, 1e-8)
+        compute_ms = max(iter_ms - comm_ms, 0.0)
+        overlap_ratio = overlap_efficiency(step_ms=iter_ms, compute_ms=compute_ms, communication_ms=comm_ms)
 
         if rank == 0 and (step % args.log_interval == 0 or step == 1 or step == args.max_steps):
             avg_loss = sum(recent_losses) / len(recent_losses)
@@ -279,6 +336,8 @@ def train(args: argparse.Namespace) -> None:
                 f"[step {step:05d}] loss={step_loss:.4f} avg100={avg_loss:.4f} "
                 f"tokens/s={tokens_per_second:,.0f} grad_norm={grad_norm_value:.3f} "
                 f"fb_ms={fwd_bwd_ms:.2f} comm_ms={comm_ms:.2f} opt_ms={step_stats['optim_ms']:.2f}"
+                ,
+                flush=True,
             )
 
         if rank_profile_enabled:
@@ -292,12 +351,14 @@ def train(args: argparse.Namespace) -> None:
                     "communication_ms": comm_ms,
                     "optimizer_ms": float(step_stats["optim_ms"]),
                     "iteration_ms": iter_ms,
+                    "overlap_ratio": overlap_ratio,
                 }
             )
 
         if should_record_memory and rank_profile_enabled:
             if step == 1 or step == args.max_steps or step % args.profile_memory_interval == 0:
                 memory.record(f"step_{step}")
+                log_event(rank, f"recorded memory snapshot step={step} {format_device_memory(device)}", force=verbose_enabled or args.verbose_memory)
 
         if args.checkpoint_interval > 0 and (step % args.checkpoint_interval == 0 or step == args.max_steps):
             path = save_checkpoint(
@@ -310,24 +371,48 @@ def train(args: argparse.Namespace) -> None:
                 extra={"model_config": cfg.to_dict(), "step_loss": step_loss},
             )
             if rank == 0:
-                print(f"[checkpoint] wrote {path}")
+                print(f"[checkpoint] wrote {path}", flush=True)
 
     elapsed = time.perf_counter() - t_train_start
     if rank == 0:
-        print(f"[done] trained {args.max_steps} steps in {elapsed:.1f}s")
+        print(f"[done] trained {args.max_steps} steps in {elapsed:.1f}s", flush=True)
 
     if rank_profile_enabled:
         summaries = timers.summarize()
         timer_payload = {name: asdict(summary) for name, summary in summaries.items()}
+        state_memory_breakdown_mb = None
+        if hasattr(engine, "memory_state_breakdown_mb"):
+            state_memory_breakdown_mb = engine.memory_state_breakdown_mb()
+        overlap_summary = None
+        if step_profiles:
+            overlap_values = [float(step["overlap_ratio"]) for step in step_profiles]
+            overlap_summary = {
+                "mean": float(sum(overlap_values) / len(overlap_values)),
+                "min": float(min(overlap_values)),
+                "max": float(max(overlap_values)),
+            }
         profile_payload = {
             "rank": rank,
             "world_size": world_size,
             "stage": args.zero_stage,
             "collective_impl": args.collective_impl,
             "args": vars(args),
+            "model_config": cfg.to_dict(),
+            "optimizer_config": {
+                "lr": args.learning_rate,
+                "betas": [args.beta1, args.beta2],
+                "eps": args.eps,
+                "weight_decay": args.weight_decay,
+                "max_grad_norm": args.max_grad_norm,
+            },
+            "global_batch_size": args.batch_size * args.grad_accum_steps * world_size,
+            "microbatch_size_per_gpu": args.batch_size,
+            "overlap_enabled": False,
             "timers": timer_payload,
             "memory": memory.as_dicts() if should_record_memory else [],
             "steps": step_profiles,
+            "state_memory_breakdown_mb": state_memory_breakdown_mb,
+            "overlap_summary": overlap_summary,
         }
 
         profile_path = Path(args.profile_json)
@@ -336,10 +421,12 @@ def train(args: argparse.Namespace) -> None:
         profile_path.parent.mkdir(parents=True, exist_ok=True)
         profile_path.write_text(json.dumps(profile_payload, indent=2))
         if rank == 0 or not args.profile_rank0_only:
-            print(f"[profile] wrote {profile_path}")
+            print(f"[profile] wrote {profile_path}", flush=True)
 
     if dist.is_available() and dist.is_initialized():
+        log_event(rank, "waiting at final barrier", force=verbose_enabled)
         dist.barrier()
+        log_event(rank, "destroying process group", force=verbose_enabled)
         dist.destroy_process_group()
 
 

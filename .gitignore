@@ -7,3 +7,12 @@ experiments/results/*.json
 # local envs
 .venv/
 venv/
+
+# temp experiment data
+experiments/results/*
+experiments/configs/*
+analysis/figures/*
+
+# bundle files
+*.tar.gz
+

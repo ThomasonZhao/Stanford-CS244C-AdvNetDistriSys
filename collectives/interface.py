@@ -10,6 +10,21 @@ import torch.distributed as dist
 from ._ring import ring_allgather, ring_allreduce, ring_reduce_scatter
 
 
+def _validate_send_recv_tensor_backend(tensor: torch.Tensor) -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if tensor.device.type != "cuda":
+        return
+
+    backend = dist.get_backend()
+    if backend == "nccl":
+        raise RuntimeError(
+            "SendRecvCollectives uses point-to-point isend/irecv ring ops. "
+            "This code path hangs on CUDA tensors with an NCCL process group in this repo. "
+            "Use --collective-impl torch for multi-GPU CUDA runs, or run the ring collectives on CPU/Gloo."
+        )
+
+
 @dataclass
 class CollectiveOps:
     """Black-box communication interface consumed by ZeRO wrappers."""
@@ -46,12 +61,15 @@ class SendRecvCollectives(CollectiveOps):
     """Custom collectives implemented from send/recv primitives."""
 
     def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
+        _validate_send_recv_tensor_backend(tensor)
         return ring_allreduce(tensor=tensor, average=average)
 
     def reduce_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
+        _validate_send_recv_tensor_backend(tensor)
         return ring_reduce_scatter(tensor=tensor)
 
     def allgather(self, local_shard: torch.Tensor) -> torch.Tensor:
+        _validate_send_recv_tensor_backend(local_shard)
         return ring_allgather(local_shard=local_shard)
 
 
