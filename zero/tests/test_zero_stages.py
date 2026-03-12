@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 
 from model.config import ModelConfig
 from model.llama import LlamaForCausalLM
+from profiler import MemoryTracker
 from zero import ZeROStage0DDP, ZeROStage1Optimizer, ZeROStage2Optimizer, ZeROStage3Optimizer
 
 
@@ -350,15 +351,18 @@ def _stage2_sharded_grad_worker(rank: int, world_size: int, port: int) -> None:
         loss = model(input_ids=local_ids, labels=local_ids).loss
         assert loss is not None
         engine.backward(loss)
+        assert all(param.grad is None for param in model.parameters())
+        assert engine.grad_shard is not None
+        assert float(engine.grad_shard.abs().sum().item()) > 0.0
         engine.step()
 
         assert all(param.grad is None for param in model.parameters())
-        assert engine.grad_shard.numel() == engine.shard.shard_numel
+        assert engine.grad_shard is None
 
         measured = engine.memory_state_breakdown_mb()
         full_grad_mb = sum(param.numel() * 4 for param in model.parameters()) / (1024.0 * 1024.0)
         assert measured["grads_mb"] < full_grad_mb
-        assert measured["grads_mb"] > 0.0
+        assert measured["grads_mb"] == 0.0
     finally:
         dist.barrier()
         dist.destroy_process_group()
@@ -367,3 +371,52 @@ def _stage2_sharded_grad_worker(rank: int, world_size: int, port: int) -> None:
 def test_stage2_releases_full_grads_and_keeps_shard_world2() -> None:
     port = _find_free_port()
     mp.spawn(_stage2_sharded_grad_worker, args=(2, port), nprocs=2, join=True)
+
+
+def test_stage2_memory_trace_records_internal_labels_world1() -> None:
+    cfg = _test_config()
+    model = LlamaForCausalLM(cfg)
+    timeline = []
+    engine = ZeROStage2Optimizer(
+        model=model,
+        lr=1e-3,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.0,
+        memory_tracker=MemoryTracker(device=None),
+        memory_trace_active=True,
+        memory_state_timeline=timeline,
+    )
+
+    local_ids = _local_batch(step=0, rank=0, batch_size=3, seq_len=cfg.max_seq_len, vocab_size=cfg.vocab_size)
+    engine.zero_grad()
+    engine.prepare_forward()
+    loss = model(input_ids=local_ids, labels=local_ids).loss
+    assert loss is not None
+    engine.backward(loss)
+    engine.step()
+
+    labels = [item["label"] for item in timeline]
+    assert labels == [
+        "measured_step_stage2_bucket0_ready",
+        "measured_step_stage2_bucket0_pre_reduce_scatter",
+        "measured_step_stage2_bucket0_post_reduce_scatter",
+        "measured_step_stage2_bucket0_post_free",
+        "measured_step_stage2_pre_allgather",
+        "measured_step_stage2_post_allgather",
+        "measured_step_stage2_post_step_free_grad_shard",
+    ]
+
+
+def test_stage3_live_state_breakdown_includes_local_param_shards_world1() -> None:
+    cfg = _test_config()
+    model = LlamaForCausalLM(cfg)
+    engine = ZeROStage3Optimizer(model=model, lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+
+    live = engine.live_model_state_breakdown_mb()
+    measured = engine.memory_state_breakdown_mb()
+
+    assert live["params_mb"] == pytest.approx(measured["params_mb"])
+    assert live["grads_mb"] == pytest.approx(measured["grads_mb"])
+    assert live["optimizer_mb"] == pytest.approx(measured["optimizer_mb"])
+    assert live["total_mb"] == pytest.approx(measured["total_mb"])

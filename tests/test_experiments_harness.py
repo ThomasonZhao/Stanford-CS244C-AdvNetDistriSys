@@ -111,6 +111,42 @@ def test_parse_profile_memory_extracts_peaks(tmp_path: Path) -> None:
     }
 
 
+def test_parse_profile_memory_prefers_measured_step_peaks(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "memory": [
+                    {
+                        "label": "step_1_end",
+                        "host_maxrss_mb": 150.0,
+                        "cuda_allocated_mb": 12.0,
+                        "cuda_reserved_mb": 20.0,
+                        "cuda_max_allocated_mb": 35.0,
+                        "cuda_max_reserved_mb": 45.0,
+                    }
+                ],
+                "measured_step_memory": {
+                    "step": 4,
+                    "peak_allocated_mb": 77.0,
+                    "peak_reserved_mb": 88.0,
+                },
+            }
+        )
+    )
+
+    metrics = harness._parse_profile_memory(profile_path)
+
+    assert metrics == {
+        "peak_host_rss_mb": 150.0,
+        "peak_cuda_allocated_mb": 77.0,
+        "peak_cuda_reserved_mb": 88.0,
+        "peak_cuda_max_allocated_mb": 77.0,
+        "peak_cuda_max_reserved_mb": 88.0,
+        "measured_state_memory_mb": None,
+    }
+
+
 def test_merge_config_file_overrides_defaults_and_matrix(tmp_path: Path) -> None:
     cfg = {
         "defaults": {

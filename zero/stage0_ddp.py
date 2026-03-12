@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from collectives import CollectiveOps, LocalCollectives, SendRecvCollectives
+from profiler import MemoryTracker
 from .common import (
     assign_flat_grads,
     build_flat_param_metadata,
@@ -30,6 +31,9 @@ class ZeROStage0DDP:
     eps: float = 1e-8
     weight_decay: float = 0.1
     collectives: Optional[CollectiveOps] = None
+    memory_tracker: Optional[MemoryTracker] = None
+    memory_trace_active: bool = False
+    memory_state_timeline: Optional[List[Dict[str, object]]] = None
 
     def __post_init__(self) -> None:
         rank, world_size = get_rank_world_size()
@@ -64,13 +68,23 @@ class ZeROStage0DDP:
             flat_grads.mul_(scale)
         return grad_norm
 
+    def _record_memory_event(self, label: str) -> None:
+        if self.memory_tracker is None or not self.memory_trace_active:
+            return
+        self.memory_tracker.record(label)
+        if self.memory_state_timeline is None:
+            return
+        self.memory_state_timeline.append({"label": label, **self.live_model_state_breakdown_mb()})
+
     def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
         t0 = time.perf_counter()
         flat_grads = flatten_grads_fp32(self.meta)
 
+        self._record_memory_event("measured_step_stage0_pre_allreduce")
         t_comm0 = time.perf_counter()
         reduced = self.collectives.allreduce(flat_grads, average=True)
         comm_ms = (time.perf_counter() - t_comm0) * 1000.0
+        self._record_memory_event("measured_step_stage0_post_allreduce")
 
         grad_norm = self._clip_flat_grads_inplace(reduced, max_grad_norm=max_grad_norm)
 
@@ -79,6 +93,7 @@ class ZeROStage0DDP:
         t_opt0 = time.perf_counter()
         self.optimizer.step()
         optim_ms = (time.perf_counter() - t_opt0) * 1000.0
+        self._record_memory_event("measured_step_stage0_post_optimizer")
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         return {
@@ -107,6 +122,9 @@ class ZeROStage0DDP:
             "optimizer_mb": optimizer_mb,
             "total_mb": params_mb + grads_mb + optimizer_mb,
         }
+
+    def live_model_state_breakdown_mb(self) -> Dict[str, float]:
+        return self.memory_state_breakdown_mb()
 
     def state_dict(self) -> Dict[str, object]:
         return {

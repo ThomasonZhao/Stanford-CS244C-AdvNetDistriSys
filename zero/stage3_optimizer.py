@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from collectives import CollectiveOps, LocalCollectives, SendRecvCollectives
+from profiler import MemoryTracker
 from .common import (
     FlatParamMetadata,
     ShardSpec,
@@ -20,6 +21,8 @@ from .common import (
     compute_shard_spec,
     flatten_params_fp32,
     get_rank_world_size,
+    grads_num_bytes,
+    params_num_bytes,
     tensors_num_bytes,
     unique_trainable_params,
 )
@@ -41,6 +44,7 @@ class _Stage3ParamHandle:
     meta: FlatParamMetadata
     shard: ShardSpec
     collectives: CollectiveOps
+    engine: Optional["ZeROStage3Optimizer"] = None
     module_names: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -132,10 +136,14 @@ class _ShardedModuleFunction(torch.autograd.Function):
             ctx.autocast_enabled = False
             ctx.autocast_dtype = torch.float32
 
+        runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_forward")
         runner.engine._record_forward_comm_ms(runner.handle.materialize())
+        runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_post_allgather_forward")
         with torch.no_grad():
             output = runner.module(*args)
+        runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_forward")
         runner.handle.reshard()
+        runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_forward_discard")
         return output
 
     @staticmethod
@@ -158,7 +166,9 @@ class _ShardedModuleFunction(torch.autograd.Function):
             if ctx.cuda_rng_state is not None:
                 torch.cuda.set_rng_state(ctx.cuda_rng_state, device=devices[0])
 
+            runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_pre_allgather_backward")
             comm_ms = runner.handle.materialize()
+            runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_post_allgather_backward")
 
             with torch.enable_grad():
                 for is_tensor, requires_grad, non_tensor in zip(
@@ -195,8 +205,10 @@ class _ShardedModuleFunction(torch.autograd.Function):
 
             input_grads = grads[: len(grad_inputs)]
             param_grads = grads[len(grad_inputs) :]
+            runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_layer_backward")
             comm_ms += runner.handle.accumulate_grad_shard(param_grads)
             runner.handle.reshard()
+            runner.engine._record_memory_event(f"measured_step_stage3_{runner.name}_after_reduce_scatter_discard")
 
         runner.engine._record_backward_comm_ms(comm_ms)
 
@@ -243,6 +255,9 @@ class ZeROStage3Optimizer:
     eps: float = 1e-8
     weight_decay: float = 0.1
     collectives: Optional[CollectiveOps] = None
+    memory_tracker: Optional[MemoryTracker] = None
+    memory_trace_active: bool = False
+    memory_state_timeline: Optional[List[Dict[str, object]]] = None
 
     def __post_init__(self) -> None:
         rank, world_size = get_rank_world_size()
@@ -287,6 +302,7 @@ class ZeROStage3Optimizer:
                     meta=meta,
                     shard=shard,
                     collectives=self.collectives,
+                    engine=self,
                     module_names=[module_name],
                 )
                 handle_by_param_ids[key] = handle
@@ -313,6 +329,15 @@ class ZeROStage3Optimizer:
 
     def _record_backward_comm_ms(self, value: float) -> None:
         self._backward_comm_ms += value
+
+    def _record_memory_event(self, label: str) -> None:
+        if self.memory_tracker is None or not self.memory_trace_active:
+            return
+        self.memory_tracker.record(label)
+        if self.memory_state_timeline is None:
+            return
+        breakdown = self.live_model_state_breakdown_mb()
+        self.memory_state_timeline.append({"label": label, **breakdown})
 
     def _reshard_all_params(self) -> None:
         if self._summon_depth > 0:
@@ -414,6 +439,21 @@ class ZeROStage3Optimizer:
 
         params_mb = bytes_to_mb(tensors_num_bytes(local_param_tensors))
         grads_mb = bytes_to_mb(tensors_num_bytes(grad_tensors))
+        optimizer_mb = bytes_to_mb(tensors_num_bytes(optimizer_tensors))
+        return {
+            "params_mb": params_mb,
+            "grads_mb": grads_mb,
+            "optimizer_mb": optimizer_mb,
+            "total_mb": params_mb + grads_mb + optimizer_mb,
+        }
+
+    def live_model_state_breakdown_mb(self) -> Dict[str, float]:
+        local_param_tensors = [handle.local_param_shard for handle in self._handle_order]
+        params_mb = bytes_to_mb(tensors_num_bytes(local_param_tensors) + params_num_bytes(self.model.parameters()))
+        grads_mb = bytes_to_mb(grads_num_bytes(self.model.parameters()) + tensors_num_bytes([handle.grad_shard for handle in self._handle_order]))
+        optimizer_tensors = []
+        for handle in self._handle_order:
+            optimizer_tensors.extend([handle.exp_avg, handle.exp_avg_sq])
         optimizer_mb = bytes_to_mb(tensors_num_bytes(optimizer_tensors))
         return {
             "params_mb": params_mb,

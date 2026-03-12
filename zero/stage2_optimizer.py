@@ -2,26 +2,55 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
 from collectives import CollectiveOps, LocalCollectives, SendRecvCollectives
+from profiler import MemoryTracker
 from .common import (
     ShardSpec,
     assign_flat_params,
     build_flat_param_metadata,
     bytes_to_mb,
     compute_shard_spec,
-    flatten_grads_fp32,
     flatten_params_fp32,
     get_rank_world_size,
+    grads_num_bytes,
     params_num_bytes,
     tensors_num_bytes,
 )
+
+
+@dataclass
+class _Stage2GradBucket:
+    index: int
+    param_indices: List[int]
+    start: int
+    end: int
+    rank_piece_numels: List[int]
+    packed_chunk_numel: int
+    local_piece_numel: int
+    local_shard_offset: int
+    pending_params: int = 0
+    ready_mask: List[bool] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.ready_mask:
+            self.ready_mask = [False for _ in self.param_indices]
+        self.pending_params = len(self.param_indices)
+
+    @property
+    def numel(self) -> int:
+        return self.end - self.start
+
+    def reset(self) -> None:
+        self.pending_params = len(self.param_indices)
+        for idx in range(len(self.ready_mask)):
+            self.ready_mask[idx] = False
 
 
 @dataclass
@@ -34,6 +63,9 @@ class ZeROStage2Optimizer:
     eps: float = 1e-8
     weight_decay: float = 0.1
     collectives: Optional[CollectiveOps] = None
+    memory_tracker: Optional[MemoryTracker] = None
+    memory_trace_active: bool = False
+    memory_state_timeline: Optional[List[Dict[str, object]]] = None
 
     def __post_init__(self) -> None:
         rank, world_size = get_rank_world_size()
@@ -49,22 +81,32 @@ class ZeROStage2Optimizer:
         self.step_count = 0
         self.exp_avg = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
         self.exp_avg_sq = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
-        self.grad_shard = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
+        self.grad_shard: Optional[torch.Tensor] = None
+        self._backward_comm_ms = 0.0
+        self._bucket_target_numel = self.meta.total_numel
+        self._grad_buckets = self._build_grad_buckets()
+        self._param_to_bucket: Dict[int, int] = {}
+        self._param_to_bucket_offset: Dict[int, int] = {}
+        for bucket in self._grad_buckets:
+            for bucket_offset, param_idx in enumerate(bucket.param_indices):
+                self._param_to_bucket[param_idx] = bucket.index
+                self._param_to_bucket_offset[param_idx] = bucket_offset
+        self._grad_hook_handles = self._register_grad_hooks()
 
     def backward(self, loss: torch.Tensor) -> None:
         loss.backward()
+        self._flush_pending_buckets(force=True)
 
     def prepare_forward(self) -> Dict[str, float]:
         return {"prepare_comm_ms": 0.0}
 
     def zero_grad(self) -> None:
-        self.grad_shard.zero_()
+        self._backward_comm_ms = 0.0
+        self.grad_shard = None
         for p in self.meta.params:
             p.grad = None
-
-    def _release_full_param_grads(self) -> None:
-        for p in self.meta.params:
-            p.grad = None
+        for bucket in self._grad_buckets:
+            bucket.reset()
 
     def _adamw_update(self, local_params: torch.Tensor, local_grads: torch.Tensor) -> torch.Tensor:
         self.step_count += 1
@@ -97,32 +139,199 @@ class ZeROStage2Optimizer:
             local_grads.mul_(scale)
         return grad_norm
 
-    def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
-        t0 = time.perf_counter()
-        flat_params = flatten_params_fp32(self.meta)
-        flat_grads = flatten_grads_fp32(self.meta)
+    def _ensure_grad_shard(self) -> torch.Tensor:
+        if self.grad_shard is None:
+            self.grad_shard = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
+        return self.grad_shard
+
+    def _record_memory_event(self, label: str) -> None:
+        if self.memory_tracker is None or not self.memory_trace_active:
+            return
+        self.memory_tracker.record(label)
+        if self.memory_state_timeline is None:
+            return
+        self.memory_state_timeline.append({"label": label, **self.live_model_state_breakdown_mb()})
+
+    def _build_grad_buckets(self) -> List[_Stage2GradBucket]:
+        buckets: List[_Stage2GradBucket] = []
+        current_indices: List[int] = []
+        current_start: Optional[int] = None
+        current_end: Optional[int] = None
+
+        for param_idx, (param, start) in enumerate(zip(self.meta.params, self.meta.offsets)):
+            param_end = start + param.numel()
+            if current_start is None:
+                current_start = start
+                current_end = param_end
+                current_indices = [param_idx]
+                continue
+
+            if (current_end - current_start) >= self._bucket_target_numel:
+                buckets.append(self._make_bucket(index=len(buckets), param_indices=current_indices, start=current_start, end=current_end))
+                current_start = start
+                current_end = param_end
+                current_indices = [param_idx]
+                continue
+
+            current_indices.append(param_idx)
+            current_end = param_end
+
+        if current_indices and current_start is not None and current_end is not None:
+            buckets.append(self._make_bucket(index=len(buckets), param_indices=current_indices, start=current_start, end=current_end))
+        return buckets
+
+    def _make_bucket(self, index: int, param_indices: List[int], start: int, end: int) -> _Stage2GradBucket:
+        rank_piece_numels: List[int] = []
+        for rank in range(self.world_size):
+            shard_start = rank * self.shard.chunk_size
+            shard_end = min(shard_start + self.shard.chunk_size, self.meta.total_numel)
+            overlap_start = max(start, shard_start)
+            overlap_end = min(end, shard_end)
+            rank_piece_numels.append(max(0, overlap_end - overlap_start))
+
+        local_overlap_start = max(start, self.shard.shard_start)
+        local_overlap_end = min(end, self.shard.shard_end)
+        local_piece_numel = max(0, local_overlap_end - local_overlap_start)
+        return _Stage2GradBucket(
+            index=index,
+            param_indices=list(param_indices),
+            start=start,
+            end=end,
+            rank_piece_numels=rank_piece_numels,
+            packed_chunk_numel=max(1, max(rank_piece_numels) if rank_piece_numels else 0),
+            local_piece_numel=local_piece_numel,
+            local_shard_offset=max(0, local_overlap_start - self.shard.shard_start),
+        )
+
+    def _register_grad_hooks(self):
+        handles = []
+        for param_idx, param in enumerate(self.meta.params):
+            def _hook(grad_param: torch.Tensor, *, _param_idx: int = param_idx) -> None:
+                del grad_param
+                bucket_idx = self._param_to_bucket[_param_idx]
+                bucket = self._grad_buckets[bucket_idx]
+                bucket_offset = self._param_to_bucket_offset[_param_idx]
+                if bucket.ready_mask[bucket_offset]:
+                    return
+                bucket.ready_mask[bucket_offset] = True
+                bucket.pending_params -= 1
+                if bucket.pending_params == 0:
+                    self._flush_bucket(bucket_idx)
+
+            handles.append(param.register_post_accumulate_grad_hook(_hook))
+        return handles
+
+    def _pack_bucket_inputs(self, bucket: _Stage2GradBucket) -> torch.Tensor:
+        packed = torch.zeros(
+            self.world_size * bucket.packed_chunk_numel,
+            dtype=torch.float32,
+            device=self.meta.device,
+        )
+        chunk_views = [
+            packed[rank * bucket.packed_chunk_numel : (rank + 1) * bucket.packed_chunk_numel]
+            for rank in range(self.world_size)
+        ]
+        write_offsets = [0 for _ in range(self.world_size)]
+
+        for param_idx in bucket.param_indices:
+            param = self.meta.params[param_idx]
+            grad = param.grad
+            param_start = self.meta.offsets[param_idx]
+            param_end = param_start + param.numel()
+            flat_grad = None
+            if grad is not None:
+                flat_grad = grad.detach().view(-1)
+                if flat_grad.dtype != torch.float32:
+                    flat_grad = flat_grad.to(torch.float32)
+
+            first_rank = param_start // self.shard.chunk_size
+            last_rank = (param_end - 1) // self.shard.chunk_size
+            for rank in range(first_rank, last_rank + 1):
+                shard_start = rank * self.shard.chunk_size
+                shard_end = min(shard_start + self.shard.chunk_size, self.meta.total_numel)
+                overlap_start = max(param_start, shard_start)
+                overlap_end = min(param_end, shard_end)
+                if overlap_end <= overlap_start:
+                    continue
+                piece_len = overlap_end - overlap_start
+                dst_start = write_offsets[rank]
+                dst_end = dst_start + piece_len
+                if flat_grad is not None:
+                    src_start = overlap_start - param_start
+                    src_end = src_start + piece_len
+                    chunk_views[rank][dst_start:dst_end].copy_(flat_grad[src_start:src_end])
+                write_offsets[rank] = dst_end
+
+        for rank, piece_len in enumerate(bucket.rank_piece_numels):
+            if write_offsets[rank] != piece_len:
+                raise RuntimeError(
+                    f"bucket {bucket.index} packed wrong numel for rank {rank}: {write_offsets[rank]} != {piece_len}"
+                )
+        return packed
+
+    def _free_bucket_grads(self, bucket: _Stage2GradBucket) -> None:
+        for param_idx in bucket.param_indices:
+            self.meta.params[param_idx].grad = None
+
+    def _flush_bucket(self, bucket_idx: int) -> None:
+        bucket = self._grad_buckets[bucket_idx]
+        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_ready")
+        packed = self._pack_bucket_inputs(bucket)
+        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_pre_reduce_scatter")
 
         t_comm0 = time.perf_counter()
-        reduced_shard = self.collectives.reduce_scatter(flat_grads)
+        reduced_shard = self.collectives.reduce_scatter(packed)
         reduced_shard = reduced_shard / self.world_size
-        comm_ms = (time.perf_counter() - t_comm0) * 1000.0
+        self._backward_comm_ms += (time.perf_counter() - t_comm0) * 1000.0
 
-        expected = self.shard.shard_numel
-        if reduced_shard.numel() < expected:
-            raise ValueError(f"reduce_scatter returned too few elements: {reduced_shard.numel()} < {expected}")
-        self.grad_shard.copy_(reduced_shard[:expected])
-        self._release_full_param_grads()
-        grad_norm = self._clip_local_grads_inplace(self.grad_shard, max_grad_norm=max_grad_norm)
+        if bucket.local_piece_numel > 0:
+            if reduced_shard.numel() < bucket.local_piece_numel:
+                raise ValueError(
+                    f"bucket {bucket.index} reduce_scatter returned too few elements: "
+                    f"{reduced_shard.numel()} < {bucket.local_piece_numel}"
+                )
+            start = bucket.local_shard_offset
+            end = start + bucket.local_piece_numel
+            grad_shard = self._ensure_grad_shard()
+            grad_shard[start:end].add_(reduced_shard[: bucket.local_piece_numel])
+
+        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_post_reduce_scatter")
+        self._free_bucket_grads(bucket)
+        del packed
+        del reduced_shard
+        self._record_memory_event(f"measured_step_stage2_bucket{bucket.index}_post_free")
+        bucket.reset()
+
+    def _flush_pending_buckets(self, force: bool = False) -> None:
+        for bucket_idx, bucket in enumerate(self._grad_buckets):
+            if bucket.pending_params == len(bucket.param_indices):
+                continue
+            if not force and bucket.pending_params != 0:
+                continue
+            self._flush_bucket(bucket_idx)
+
+    def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
+        t0 = time.perf_counter()
+        self._flush_pending_buckets(force=True)
+        flat_params = flatten_params_fp32(self.meta)
+        if any(param.grad is not None for param in self.meta.params):
+            raise RuntimeError("Stage 2 step should not retain full param.grad tensors after backward partitioning")
+        grad_shard = self._ensure_grad_shard()
+        grad_norm = self._clip_local_grads_inplace(grad_shard, max_grad_norm=max_grad_norm)
 
         local_params = flat_params[self.shard.shard_start : self.shard.shard_end].clone()
         t_opt0 = time.perf_counter()
-        updated_local = self._adamw_update(local_params=local_params, local_grads=self.grad_shard)
+        updated_local = self._adamw_update(local_params=local_params, local_grads=grad_shard)
         optim_ms = (time.perf_counter() - t_opt0) * 1000.0
 
+        self._record_memory_event("measured_step_stage2_pre_allgather")
         t_comm1 = time.perf_counter()
         full_updated = self.collectives.allgather(updated_local)
-        comm_ms += (time.perf_counter() - t_comm1) * 1000.0
+        comm_ms = self._backward_comm_ms + ((time.perf_counter() - t_comm1) * 1000.0)
         assign_flat_params(self.meta, full_updated[: self.meta.total_numel])
+        self._record_memory_event("measured_step_stage2_post_allgather")
+        self.grad_shard = None
+        self._record_memory_event("measured_step_stage2_post_step_free_grad_shard")
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         return {
@@ -138,6 +347,17 @@ class ZeROStage2Optimizer:
     def memory_state_breakdown_mb(self) -> Dict[str, float]:
         params_mb = bytes_to_mb(params_num_bytes(self.meta.params))
         grads_mb = bytes_to_mb(tensors_num_bytes([self.grad_shard]))
+        optimizer_mb = bytes_to_mb(tensors_num_bytes([self.exp_avg, self.exp_avg_sq]))
+        return {
+            "params_mb": params_mb,
+            "grads_mb": grads_mb,
+            "optimizer_mb": optimizer_mb,
+            "total_mb": params_mb + grads_mb + optimizer_mb,
+        }
+
+    def live_model_state_breakdown_mb(self) -> Dict[str, float]:
+        params_mb = bytes_to_mb(params_num_bytes(self.meta.params))
+        grads_mb = bytes_to_mb(grads_num_bytes(self.meta.params) + tensors_num_bytes([self.grad_shard]))
         optimizer_mb = bytes_to_mb(tensors_num_bytes([self.exp_avg, self.exp_avg_sq]))
         return {
             "params_mb": params_mb,
@@ -170,6 +390,6 @@ class ZeROStage2Optimizer:
         self.exp_avg_sq = state["exp_avg_sq"].to(device=self.meta.device, dtype=torch.float32)
         grad_shard = state.get("grad_shard")
         if grad_shard is None:
-            self.grad_shard = torch.zeros(self.shard.shard_numel, dtype=torch.float32, device=self.meta.device)
+            self.grad_shard = None
         else:
             self.grad_shard = grad_shard.to(device=self.meta.device, dtype=torch.float32)

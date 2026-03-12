@@ -3,12 +3,13 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from collectives import CollectiveOps, LocalCollectives, SendRecvCollectives
+from profiler import MemoryTracker
 from .common import (
     ShardSpec,
     assign_flat_params,
@@ -34,6 +35,9 @@ class ZeROStage1Optimizer:
     eps: float = 1e-8
     weight_decay: float = 0.1
     collectives: Optional[CollectiveOps] = None
+    memory_tracker: Optional[MemoryTracker] = None
+    memory_trace_active: bool = False
+    memory_state_timeline: Optional[List[Dict[str, object]]] = None
 
     def __post_init__(self) -> None:
         rank, world_size = get_rank_world_size()
@@ -85,14 +89,24 @@ class ZeROStage1Optimizer:
             flat_grads.mul_(scale)
         return grad_norm
 
+    def _record_memory_event(self, label: str) -> None:
+        if self.memory_tracker is None or not self.memory_trace_active:
+            return
+        self.memory_tracker.record(label)
+        if self.memory_state_timeline is None:
+            return
+        self.memory_state_timeline.append({"label": label, **self.live_model_state_breakdown_mb()})
+
     def step_with_stats(self, max_grad_norm: float = 0.0) -> Dict[str, float]:
         t0 = time.perf_counter()
         flat_params = flatten_params_fp32(self.meta)
         flat_grads = flatten_grads_fp32(self.meta)
 
+        self._record_memory_event("measured_step_stage1_pre_allreduce")
         t_comm0 = time.perf_counter()
         synced_grads = self.collectives.allreduce(flat_grads, average=True)
         comm_ms = (time.perf_counter() - t_comm0) * 1000.0
+        self._record_memory_event("measured_step_stage1_post_allreduce")
         grad_norm = self._clip_flat_grads_inplace(synced_grads, max_grad_norm=max_grad_norm)
 
         local_params = flat_params[self.shard.shard_start : self.shard.shard_end].clone()
@@ -102,10 +116,12 @@ class ZeROStage1Optimizer:
         updated_local = self._adamw_update(local_params=local_params, local_grads=local_grads)
         optim_ms = (time.perf_counter() - t_opt0) * 1000.0
 
+        self._record_memory_event("measured_step_stage1_pre_allgather")
         t_comm1 = time.perf_counter()
         full_updated = self.collectives.allgather(updated_local)
         comm_ms += (time.perf_counter() - t_comm1) * 1000.0
         assign_flat_params(self.meta, full_updated[: self.meta.total_numel])
+        self._record_memory_event("measured_step_stage1_post_allgather")
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         return {
@@ -128,6 +144,9 @@ class ZeROStage1Optimizer:
             "optimizer_mb": optimizer_mb,
             "total_mb": params_mb + grads_mb + optimizer_mb,
         }
+
+    def live_model_state_breakdown_mb(self) -> Dict[str, float]:
+        return self.memory_state_breakdown_mb()
 
     def state_dict(self) -> Dict[str, object]:
         return {

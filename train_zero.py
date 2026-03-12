@@ -82,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-json", type=str, default="")
     parser.add_argument("--profile-memory-interval", type=int, default=0)
     parser.add_argument("--profile-rank0-only", action="store_true")
+    parser.add_argument("--measure-memory-step", action="store_true")
+    parser.add_argument("--memory-warmup-steps", type=int, default=0)
     parser.add_argument("--tflops-mode", type=str, default="estimate", choices=["estimate", "profile", "off"])
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--verbose-memory", action="store_true")
@@ -271,13 +273,35 @@ def train(args: argparse.Namespace) -> None:
     flop_tracker = FlopTracker(device=device) if rank == 0 and args.tflops_mode == "profile" else None
     memory = MemoryTracker(device=device)
     enable_profile_output = bool(args.profile_json)
-    should_record_memory = args.profile_memory_interval > 0
+    should_record_memory = args.profile_memory_interval > 0 or args.measure_memory_step
     rank_profile_enabled = enable_profile_output and (rank == 0 or not args.profile_rank0_only)
     step_profiles = []
+    measured_step_index = args.memory_warmup_steps + 1 if args.measure_memory_step else None
+    measured_step_memory = None
+    measured_step_state_timeline = []
+    live_state_breakdown = getattr(engine, "live_model_state_breakdown_mb", None)
+    if live_state_breakdown is None:
+        live_state_breakdown = getattr(engine, "memory_state_breakdown_mb", None)
 
-    if should_record_memory and rank_profile_enabled:
+    if args.measure_memory_step and args.max_steps < measured_step_index:
+        raise ValueError(
+            f"max_steps={args.max_steps} is too small for memory warmup + measured step; need at least {measured_step_index}"
+        )
+
+    if hasattr(engine, "memory_tracker"):
+        engine.memory_tracker = memory
+    if hasattr(engine, "memory_trace_active"):
+        engine.memory_trace_active = False
+    if hasattr(engine, "memory_state_timeline"):
+        engine.memory_state_timeline = measured_step_state_timeline
+
+    if should_record_memory and rank_profile_enabled and not args.measure_memory_step:
         memory.record("start")
-        log_event(rank, f"recorded memory snapshot start {format_device_memory(device)}", force=verbose_enabled or args.verbose_memory)
+        log_event(
+            rank,
+            f"recorded memory snapshot start {format_device_memory(device)}",
+            force=verbose_enabled or args.verbose_memory,
+        )
 
     recent_losses = []
     t_train_start = time.perf_counter()
@@ -294,24 +318,62 @@ def train(args: argparse.Namespace) -> None:
 
     for step in range(1, args.max_steps + 1):
         log_event(rank, f"starting step={step}/{args.max_steps}", force=verbose_enabled)
+        sample_this_step = args.profile_memory_interval > 0 and (step == 1 or step == args.max_steps or step % args.profile_memory_interval == 0)
+        is_measured_step = measured_step_index is not None and step == measured_step_index
         iter_timer = timers.timer("iteration")
         iter_timer.start()
 
         model.train()
         engine.zero_grad()
+        if is_measured_step:
+            memory.reset_peak_stats()
+            if hasattr(engine, "memory_trace_active"):
+                engine.memory_trace_active = bool(should_record_memory and rank_profile_enabled)
+            if should_record_memory and rank_profile_enabled:
+                memory.record(f"measured_step_{step}_start")
+                if live_state_breakdown is not None:
+                    measured_step_state_timeline.append({"label": f"measured_step_{step}_start", **live_state_breakdown()})
+                log_event(
+                    rank,
+                    f"recorded memory snapshot measured_step_{step}_start {format_device_memory(device)}",
+                    force=verbose_enabled or args.verbose_memory,
+                )
+        elif sample_this_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"step_{step}_start")
+            log_event(
+                rank,
+                f"recorded memory snapshot step_{step}_start {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
         prepare_comm_ms = 0.0
         if hasattr(engine, "prepare_forward"):
             log_event(rank, f"step={step} prepare_forward begin", force=verbose_enabled)
             prepare_stats = engine.prepare_forward()
             prepare_comm_ms = float(prepare_stats.get("prepare_comm_ms", 0.0))
             log_event(rank, f"step={step} prepare_forward end prepare_comm_ms={prepare_comm_ms:.2f}", force=verbose_enabled)
+        if is_measured_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"measured_step_{step}_post_prepare")
+            if live_state_breakdown is not None:
+                measured_step_state_timeline.append({"label": f"measured_step_{step}_post_prepare", **live_state_breakdown()})
+            log_event(
+                rank,
+                f"recorded memory snapshot measured_step_{step}_post_prepare {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
+        elif sample_this_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"step_{step}_post_prepare")
+            log_event(
+                rank,
+                f"recorded memory snapshot step_{step}_post_prepare {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
         fwd_bwd_timer = timers.timer("forward_backward")
         fwd_bwd_timer.start()
 
         def run_microbatches() -> list[float]:
             micro_losses_local = []
             nonlocal data_iter
-            for _micro in range(args.grad_accum_steps):
+            for micro_idx in range(args.grad_accum_steps):
                 log_event(rank, f"step={step} microbatch begin", force=verbose_enabled)
                 try:
                     chunk = next(data_iter)
@@ -330,8 +392,34 @@ def train(args: argparse.Namespace) -> None:
                         raise RuntimeError("Model did not return loss even though labels were provided")
                     scaled_loss = loss / args.grad_accum_steps
 
+                if is_measured_step and should_record_memory and rank_profile_enabled:
+                    memory.record(f"measured_step_{step}_micro_{micro_idx + 1}_after_forward")
+                    if live_state_breakdown is not None:
+                        measured_step_state_timeline.append({"label": f"measured_step_{step}_micro_{micro_idx + 1}_after_forward", **live_state_breakdown()})
+                    log_event(
+                        rank,
+                        f"recorded memory snapshot measured_step_{step}_micro_{micro_idx + 1}_after_forward {format_device_memory(device)}",
+                        force=verbose_enabled or args.verbose_memory,
+                    )
+
                 micro_losses_local.append(float(loss.detach().float().item()))
                 engine.backward(scaled_loss)
+                if is_measured_step and should_record_memory and rank_profile_enabled:
+                    memory.record(f"measured_step_{step}_micro_{micro_idx + 1}_after_backward")
+                    if live_state_breakdown is not None:
+                        measured_step_state_timeline.append({"label": f"measured_step_{step}_micro_{micro_idx + 1}_after_backward", **live_state_breakdown()})
+                    log_event(
+                        rank,
+                        f"recorded memory snapshot measured_step_{step}_micro_{micro_idx + 1}_after_backward {format_device_memory(device)}",
+                        force=verbose_enabled or args.verbose_memory,
+                    )
+                elif sample_this_step and should_record_memory and rank_profile_enabled:
+                    memory.record(f"step_{step}_micro_{micro_idx + 1}_post_backward")
+                    log_event(
+                        rank,
+                        f"recorded memory snapshot step_{step}_micro_{micro_idx + 1}_post_backward {format_device_memory(device)}",
+                        force=verbose_enabled or args.verbose_memory,
+                    )
                 log_event(rank, f"step={step} microbatch end loss={micro_losses_local[-1]:.4f}", force=verbose_enabled)
             return micro_losses_local
 
@@ -343,6 +431,22 @@ def train(args: argparse.Namespace) -> None:
             micro_losses = run_microbatches()
 
         fwd_bwd_ms = fwd_bwd_timer.stop()
+        if is_measured_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"measured_step_{step}_post_backward")
+            if live_state_breakdown is not None:
+                measured_step_state_timeline.append({"label": f"measured_step_{step}_post_backward", **live_state_breakdown()})
+            log_event(
+                rank,
+                f"recorded memory snapshot measured_step_{step}_post_backward {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
+        elif sample_this_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"step_{step}_post_backward")
+            log_event(
+                rank,
+                f"recorded memory snapshot step_{step}_post_backward {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
         log_event(rank, f"step={step} forward_backward complete fb_ms={fwd_bwd_ms:.2f}", force=verbose_enabled)
 
         step_timer = timers.timer("optimizer_step")
@@ -352,6 +456,22 @@ def train(args: argparse.Namespace) -> None:
         _ = step_timer.stop()
         grad_norm_value = float(step_stats["grad_norm"])
         comm_ms = float(step_stats["comm_ms"]) + prepare_comm_ms
+        if is_measured_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"measured_step_{step}_post_optimizer")
+            if live_state_breakdown is not None:
+                measured_step_state_timeline.append({"label": f"measured_step_{step}_post_optimizer", **live_state_breakdown()})
+            log_event(
+                rank,
+                f"recorded memory snapshot measured_step_{step}_post_optimizer {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
+        elif sample_this_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"step_{step}_post_optimizer")
+            log_event(
+                rank,
+                f"recorded memory snapshot step_{step}_post_optimizer {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
         log_event(
             rank,
             f"step={step} optimizer step end grad_norm={grad_norm_value:.3f} comm_ms={comm_ms:.2f} optim_ms={float(step_stats['optim_ms']):.2f}",
@@ -401,10 +521,34 @@ def train(args: argparse.Namespace) -> None:
                 }
             )
 
-        if should_record_memory and rank_profile_enabled:
-            if step == 1 or step == args.max_steps or step % args.profile_memory_interval == 0:
-                memory.record(f"step_{step}")
-                log_event(rank, f"recorded memory snapshot step={step} {format_device_memory(device)}", force=verbose_enabled or args.verbose_memory)
+        if is_measured_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"measured_step_{step}_end")
+            if live_state_breakdown is not None:
+                measured_step_state_timeline.append({"label": f"measured_step_{step}_end", **live_state_breakdown()})
+            peak_stats = memory.peak_stats_mb()
+            measured_step_memory = {
+                "step": step,
+                "warmup_steps": args.memory_warmup_steps,
+                "peak_allocated_mb": float(peak_stats["peak_allocated_mb"]),
+                "peak_reserved_mb": float(peak_stats["peak_reserved_mb"]),
+            }
+            if hasattr(engine, "memory_trace_active"):
+                engine.memory_trace_active = False
+            log_event(
+                rank,
+                (
+                    f"measured_step={step} peak_allocated_mb={measured_step_memory['peak_allocated_mb']:.1f} "
+                    f"peak_reserved_mb={measured_step_memory['peak_reserved_mb']:.1f}"
+                ),
+                force=verbose_enabled or args.verbose_memory,
+            )
+        elif sample_this_step and should_record_memory and rank_profile_enabled:
+            memory.record(f"step_{step}_end")
+            log_event(
+                rank,
+                f"recorded memory snapshot step_{step}_end {format_device_memory(device)}",
+                force=verbose_enabled or args.verbose_memory,
+            )
 
         if args.checkpoint_interval > 0 and (step % args.checkpoint_interval == 0 or step == args.max_steps):
             path = save_checkpoint(
@@ -464,6 +608,8 @@ def train(args: argparse.Namespace) -> None:
             "steps": step_profiles,
             "state_memory_breakdown_mb": state_memory_breakdown_mb,
             "overlap_summary": overlap_summary,
+            "measured_step_memory": measured_step_memory,
+            "measured_step_state_timeline": measured_step_state_timeline,
         }
 
         profile_path = Path(args.profile_json)

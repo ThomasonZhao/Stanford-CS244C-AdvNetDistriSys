@@ -67,9 +67,33 @@ class MemoryTracker:
             self.snapshots = []
 
     def record(self, label: str) -> MemorySnapshot:
+        self.synchronize()
         snapshot = take_memory_snapshot(label=label, device=self.device)
         self.snapshots.append(snapshot)
         return snapshot
+
+    def synchronize(self) -> None:
+        if self.device is None or self.device.type != "cuda" or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize(self.device)
+
+    def reset_peak_stats(self) -> None:
+        if self.device is None or self.device.type != "cuda" or not torch.cuda.is_available():
+            return
+        self.synchronize()
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def peak_stats_mb(self) -> Dict[str, float]:
+        if self.device is None or self.device.type != "cuda" or not torch.cuda.is_available():
+            return {
+                "peak_allocated_mb": 0.0,
+                "peak_reserved_mb": 0.0,
+            }
+        self.synchronize()
+        return {
+            "peak_allocated_mb": torch.cuda.max_memory_allocated(self.device) / (1024.0 * 1024.0),
+            "peak_reserved_mb": torch.cuda.max_memory_reserved(self.device) / (1024.0 * 1024.0),
+        }
 
     def as_dicts(self) -> List[Dict[str, float | str]]:
         return [x.to_dict() for x in self.snapshots]

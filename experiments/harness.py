@@ -291,17 +291,27 @@ def _parse_profile_memory(profile_path: Path) -> Dict[str, object]:
 
     payload = json.loads(profile_path.read_text())
     snapshots = payload.get("memory", [])
+    measured_step_memory = payload.get("measured_step_memory")
     state_memory = payload.get("state_memory_breakdown_mb")
     measured_state_memory_mb = None
     if isinstance(state_memory, dict):
         measured_state_memory_mb = {str(key): float(value) for key, value in state_memory.items()}
+
+    measured_peak_allocated_mb = None
+    measured_peak_reserved_mb = None
+    if isinstance(measured_step_memory, dict):
+        if measured_step_memory.get("peak_allocated_mb") is not None:
+            measured_peak_allocated_mb = float(measured_step_memory["peak_allocated_mb"])
+        if measured_step_memory.get("peak_reserved_mb") is not None:
+            measured_peak_reserved_mb = float(measured_step_memory["peak_reserved_mb"])
+
     if not snapshots:
         return {
             "peak_host_rss_mb": None,
-            "peak_cuda_allocated_mb": None,
-            "peak_cuda_reserved_mb": None,
-            "peak_cuda_max_allocated_mb": None,
-            "peak_cuda_max_reserved_mb": None,
+            "peak_cuda_allocated_mb": measured_peak_allocated_mb,
+            "peak_cuda_reserved_mb": measured_peak_reserved_mb,
+            "peak_cuda_max_allocated_mb": measured_peak_allocated_mb,
+            "peak_cuda_max_reserved_mb": measured_peak_reserved_mb,
             "measured_state_memory_mb": measured_state_memory_mb,
         }
 
@@ -311,10 +321,10 @@ def _parse_profile_memory(profile_path: Path) -> Dict[str, object]:
 
     return {
         "peak_host_rss_mb": peak("host_maxrss_mb"),
-        "peak_cuda_allocated_mb": peak("cuda_allocated_mb"),
-        "peak_cuda_reserved_mb": peak("cuda_reserved_mb"),
-        "peak_cuda_max_allocated_mb": peak("cuda_max_allocated_mb"),
-        "peak_cuda_max_reserved_mb": peak("cuda_max_reserved_mb"),
+        "peak_cuda_allocated_mb": measured_peak_allocated_mb if measured_peak_allocated_mb is not None else peak("cuda_allocated_mb"),
+        "peak_cuda_reserved_mb": measured_peak_reserved_mb if measured_peak_reserved_mb is not None else peak("cuda_reserved_mb"),
+        "peak_cuda_max_allocated_mb": measured_peak_allocated_mb if measured_peak_allocated_mb is not None else peak("cuda_max_allocated_mb"),
+        "peak_cuda_max_reserved_mb": measured_peak_reserved_mb if measured_peak_reserved_mb is not None else peak("cuda_max_reserved_mb"),
         "measured_state_memory_mb": measured_state_memory_mb,
     }
 
