@@ -81,6 +81,11 @@ class TorchCollectives(CollectiveOps):
     def _supports_fast_collectives(tensor: torch.Tensor) -> bool:
         return tensor.device.type == "cuda" and hasattr(dist, "all_gather_into_tensor") and hasattr(dist, "reduce_scatter_tensor")
 
+    @staticmethod
+    def _maybe_synchronize(tensor: torch.Tensor) -> None:
+        if tensor.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(tensor.device)
+
     def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
         out = tensor.clone()
         dist.all_reduce(out)
@@ -88,6 +93,7 @@ class TorchCollectives(CollectiveOps):
             num_bytes=out.numel() * out.element_size(),
             world_size=dist.get_world_size(),
         )
+        self._maybe_synchronize(out)
         if average:
             out /= dist.get_world_size()
         return out
@@ -117,6 +123,7 @@ class TorchCollectives(CollectiveOps):
                     num_bytes=out.numel() * out.element_size(),
                     world_size=world_size,
                 )
+                self._maybe_synchronize(out)
                 start = rank * chunk
                 end = min(start + chunk, flat.numel())
                 return out[: max(0, end - start)].contiguous()
@@ -135,6 +142,7 @@ class TorchCollectives(CollectiveOps):
                     num_bytes=out.numel() * out.element_size(),
                     world_size=world_size,
                 )
+                self._maybe_synchronize(out)
                 return out
             except RuntimeError as exc:
                 # CPU/Gloo does not support reduce_scatter in many environments.
@@ -149,6 +157,7 @@ class TorchCollectives(CollectiveOps):
             num_bytes=reduced.numel() * reduced.element_size(),
             world_size=world_size,
         )
+        self._maybe_synchronize(reduced)
 
         start = rank * chunk
         end = min(start + chunk, flat.numel())
@@ -189,6 +198,7 @@ class TorchCollectives(CollectiveOps):
             num_bytes=padded.numel() * padded.element_size(),
             world_size=world_size,
         )
+        self._maybe_synchronize(padded)
 
         if len(set(sizes)) == 1:
             return torch.cat(gathered, dim=0)

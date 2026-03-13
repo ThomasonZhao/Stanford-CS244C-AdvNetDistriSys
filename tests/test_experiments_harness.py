@@ -39,6 +39,8 @@ def _base_args() -> argparse.Namespace:
         bandwidth_mode="simulated",
         sim_latency_ms=0.0,
         tc_interface="eth0",
+        socket_interface="lo",
+        socket_shaper_burst_bytes=262_144,
         theory_vocab_size=0,
         extra_args="",
     )
@@ -290,6 +292,31 @@ def test_build_launch_env_sets_simulated_bandwidth(monkeypatch) -> None:
     env = harness._build_launch_env(case)
     assert "ZERO_SIM_BW_GBPS" not in env
     assert "ZERO_SIM_LATENCY_MS" not in env
+
+
+def test_build_launch_env_sets_socket_shaper_and_nccl_socket_transport() -> None:
+    args = _base_args()
+    case = harness._build_cases(args)[-1]
+    case.bandwidth_mode = "socket"
+    case.sim_latency_ms = 2.5
+
+    env = harness._build_launch_env(case, socket_shaper_path=Path("/tmp/socket_shaper.so"))
+
+    assert env["ZERO_SOCKET_SHAPER_BW_GBPS"] == "5.0"
+    assert env["ZERO_SOCKET_SHAPER_LATENCY_MS"] == "2.5"
+    assert env["ZERO_SOCKET_SHAPER_BURST_BYTES"] == "262144"
+    assert env["NCCL_P2P_DISABLE"] == "1"
+    assert env["NCCL_SHM_DISABLE"] == "1"
+    assert env["NCCL_IB_DISABLE"] == "1"
+    assert env["NCCL_SOCKET_IFNAME"] == "lo"
+    assert env["GLOO_SOCKET_IFNAME"] == "lo"
+    assert env["LD_PRELOAD"] == "/tmp/socket_shaper.so"
+
+
+def test_verify_socket_transport_log_detects_nccl_socket_markers() -> None:
+    assert harness._verify_socket_transport_log("NCCL INFO Using network Socket")
+    assert harness._verify_socket_transport_log("Channel 00/0 : 0[0] -> 1[1] [send] via NET/Socket/0")
+    assert not harness._verify_socket_transport_log("NCCL INFO Using network IB")
 
 
 def test_run_case_timeout_records_failure(tmp_path: Path, monkeypatch) -> None:

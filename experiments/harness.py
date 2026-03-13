@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Dict, List
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOCKET_SHAPER_SOURCE = PROJECT_ROOT / "infra" / "socket_shaper.c"
+SOCKET_SHAPER_SO = PROJECT_ROOT / "infra" / "socket_shaper.so"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -46,6 +48,8 @@ class CaseConfig:
     bandwidth_mode: str
     sim_latency_ms: float
     tc_interface: str
+    socket_interface: str
+    socket_shaper_burst_bytes: int
     theory_vocab_size: int
     extra_args: str
 
@@ -124,9 +128,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Ignore this many logged training steps when computing mean step metrics.",
     )
 
-    parser.add_argument("--bandwidth-mode", type=str, default="simulated", choices=["simulated", "none", "tc"])
+    parser.add_argument("--bandwidth-mode", type=str, default="simulated", choices=["simulated", "none", "tc", "socket"])
     parser.add_argument("--sim-latency-ms", type=float, default=0.0)
     parser.add_argument("--tc-interface", type=str, default="eth0")
+    parser.add_argument("--socket-interface", type=str, default="lo")
+    parser.add_argument(
+        "--socket-shaper-burst-bytes",
+        type=int,
+        default=262_144,
+        help="Per-process socket shaper burst size in bytes for bandwidth-mode=socket.",
+    )
     parser.add_argument(
         "--theory-vocab-size",
         type=int,
@@ -228,6 +239,8 @@ def _build_cases(args: argparse.Namespace) -> List[CaseConfig]:
                 bandwidth_mode=str(args.bandwidth_mode),
                 sim_latency_ms=float(args.sim_latency_ms),
                 tc_interface=str(args.tc_interface),
+                socket_interface=str(args.socket_interface),
+                socket_shaper_burst_bytes=int(args.socket_shaper_burst_bytes),
                 theory_vocab_size=int(args.theory_vocab_size),
                 extra_args=str(args.extra_args),
             )
@@ -389,11 +402,40 @@ def _master_port_for_case(launch: LaunchConfig, case_index: int) -> int:
     return launch.master_port_base + case_index
 
 
-def _build_launch_env(case: CaseConfig) -> Dict[str, str]:
+def _ensure_socket_shaper_built() -> Path:
+    if sys.platform != "linux":
+        raise RuntimeError("bandwidth-mode=socket is only supported on Linux")
+
+    if not SOCKET_SHAPER_SO.exists() or SOCKET_SHAPER_SO.stat().st_mtime < SOCKET_SHAPER_SOURCE.stat().st_mtime:
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if cc is None:
+            raise FileNotFoundError("bandwidth-mode=socket requires 'cc' or 'gcc' to build infra/socket_shaper.so")
+        subprocess.run(
+            [
+                cc,
+                "-O2",
+                "-shared",
+                "-fPIC",
+                "-o",
+                str(SOCKET_SHAPER_SO),
+                str(SOCKET_SHAPER_SOURCE),
+                "-ldl",
+                "-pthread",
+            ],
+            check=True,
+            cwd=PROJECT_ROOT,
+        )
+    return SOCKET_SHAPER_SO
+
+
+def _build_launch_env(case: CaseConfig, socket_shaper_path: Path | None = None) -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.pop("ZERO_SIM_BW_GBPS", None)
     env.pop("ZERO_SIM_LATENCY_MS", None)
+    env.pop("ZERO_SOCKET_SHAPER_BW_GBPS", None)
+    env.pop("ZERO_SOCKET_SHAPER_LATENCY_MS", None)
+    env.pop("ZERO_SOCKET_SHAPER_BURST_BYTES", None)
 
     if case.bandwidth_mode == "simulated":
         if case.bandwidth_gbps > 0:
@@ -406,7 +448,33 @@ def _build_launch_env(case: CaseConfig) -> Dict[str, str]:
         else:
             env.pop("ZERO_SIM_LATENCY_MS", None)
 
+    if case.bandwidth_mode == "socket":
+        if socket_shaper_path is None:
+            raise ValueError("socket shaper path is required for bandwidth-mode=socket")
+
+        env["ZERO_SOCKET_SHAPER_BW_GBPS"] = str(case.bandwidth_gbps)
+        if case.sim_latency_ms > 0:
+            env["ZERO_SOCKET_SHAPER_LATENCY_MS"] = str(case.sim_latency_ms)
+        env["ZERO_SOCKET_SHAPER_BURST_BYTES"] = str(case.socket_shaper_burst_bytes)
+        env["NCCL_P2P_DISABLE"] = "1"
+        env["NCCL_SHM_DISABLE"] = "1"
+        env["NCCL_IB_DISABLE"] = "1"
+        env["NCCL_SOCKET_IFNAME"] = case.socket_interface
+        env["GLOO_SOCKET_IFNAME"] = case.socket_interface
+        env["NCCL_DEBUG"] = "INFO"
+        env["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
+
+        existing_preload = env.get("LD_PRELOAD", "").strip()
+        preload_parts = [str(socket_shaper_path)]
+        if existing_preload:
+            preload_parts.append(existing_preload)
+        env["LD_PRELOAD"] = ":".join(preload_parts)
+
     return env
+
+
+def _verify_socket_transport_log(log_text: str) -> bool:
+    return ("Using network Socket" in log_text) or ("via NET/Socket/" in log_text)
 
 
 def _build_train_zero_cmd(case: CaseConfig, profile_path: Path, launch: LaunchConfig, case_index: int) -> List[str]:
@@ -502,7 +570,8 @@ def _run_case(
     log_path = logs_dir / f"{case_id}.log"
     profile_path = profiles_dir / f"{case_id}.json"
     cmd = _build_train_zero_cmd(case=case, profile_path=profile_path, launch=launch, case_index=case_index)
-    env = _build_launch_env(case)
+    socket_shaper_path = _ensure_socket_shaper_built() if case.bandwidth_mode == "socket" else None
+    env = _build_launch_env(case, socket_shaper_path=socket_shaper_path)
     command_str = " ".join(shlex.quote(x) for x in cmd)
 
     if dry_run:
@@ -562,6 +631,10 @@ def _run_case(
             _clear_tc(case)
 
     elapsed_s = time.perf_counter() - t0
+    if return_code == 0 and case.bandwidth_mode == "socket" and not _verify_socket_transport_log(log_text):
+        return_code = 125
+        notes = "socket_transport_verification_failed"
+        log_text += "\n[harness] expected NCCL NET/Socket transport markers were missing from the log\n"
     log_path.write_text(log_text)
 
     metrics = _parse_step_metrics(log_text, metrics_warmup_steps=case.metrics_warmup_steps)

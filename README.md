@@ -34,11 +34,13 @@ For the current experiment status, runbook, and remaining execution plan, read `
 - `train_zero.py --zero-stage 3` integration
 - `experiments/harness.py`: idempotent matrix runner for stage/model/bandwidth sweeps
 - `experiments/run_remote_bandwidth_sweep.py`: ship the current repo to an isolated remote workspace, run a sweep, sync results back, and generate plots + a markdown report
-- Simulated bandwidth mode via env-driven collective delay (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
+- Linux socket-transport bandwidth shaping via `LD_PRELOAD` + forced NCCL `NET/Socket` on loopback
+- Legacy collective-delay simulation mode for quick debugging (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
 - Optional `tc` throttling mode integration in harness
 - Per-case measured peak memory extraction + theoretical state-memory breakdown (params/grads/optimizer by stage)
 - `analysis/visualize.py`: plots for throughput/communication vs bandwidth, loss curves, and measured/theoretical memory
 - `analysis/bandwidth_report.py`: markdown summary of best stage by bandwidth plus throughput/communication tables
+- `scripts/benchmark_allreduce.py`: raw allreduce throughput benchmark for validating shaped transports
 
 ## Repository Layout
 
@@ -121,7 +123,8 @@ python3 experiments/harness.py \
   --stages 0 1 2 3 \
   --model-sizes medium \
   --bandwidth-gbps 0 1 2.5 5 10 25 50 \
-  --bandwidth-mode simulated \
+  --bandwidth-mode socket \
+  --socket-interface lo \
   --nproc-per-node 2 \
   --steps 100
 ```
@@ -144,17 +147,17 @@ Run the current branch on a remote GPU machine in an isolated workspace and pull
 python3 experiments/run_remote_bandwidth_sweep.py \
   --host 184.144.213.79 \
   --port 40787 \
-  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json \
+  --config experiments/configs/remote_4gpu_small_bandwidth_socket.json \
   --overwrite-local
 ```
 
-Use the denser 7-point bandwidth sweep only when you need more curve detail above the knee:
+Use the simulated fast config only for coarse debugging when socket shaping is unavailable:
 
 ```bash
 python3 experiments/run_remote_bandwidth_sweep.py \
   --host 184.144.213.79 \
   --port 40787 \
-  --config experiments/configs/remote_4gpu_small_bandwidth_simulated.json \
+  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json \
   --overwrite-local
 ```
 

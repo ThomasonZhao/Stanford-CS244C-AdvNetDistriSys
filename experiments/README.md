@@ -82,9 +82,9 @@ The main metrics in this repo are:
 
 For bandwidth sweeps, use `--metrics-warmup-steps 1` or higher so mean throughput and communication exclude allocator and CUDA startup noise from step 1.
 
-Bandwidth in the standard local sweep is usually simulated. In that mode the harness sets `ZERO_SIM_BW_GBPS` and `ZERO_SIM_LATENCY_MS`, and the collective wrappers inject delay to emulate slower communication. A bandwidth value of `0` means no injected slowdown.
+On a single Linux multi-GPU machine, prefer `bandwidth-mode=socket`. It forces NCCL onto `NET/Socket` over `lo`, injects shaping below the collective layer through an `LD_PRELOAD` socket shaper, and keeps the bandwidth experiment tied to real socket traffic instead of collective-specific delay formulas.
 
-For quick remote iteration, prefer `experiments/configs/remote_4gpu_small_bandwidth_fast.json`. It keeps only the useful bandwidth points around the knee (`0, 1, 2, 5, 10 Gbps`) and uses `12` steps with `2` warmup steps. The denser `remote_4gpu_small_bandwidth_simulated.json` config is still available when you want more detail above the knee.
+Use `experiments/configs/remote_4gpu_small_bandwidth_socket.json` as the default single-host bandwidth sweep. It keeps only the useful bandwidth points around the knee (`0, 1, 2, 5, 10 Gbps`) and uses `12` steps with `2` warmup steps. The older `remote_4gpu_small_bandwidth_fast.json` and `remote_4gpu_small_bandwidth_simulated.json` configs are only for coarse debugging when socket shaping is unavailable.
 
 ## Recommended Evaluation Order
 
@@ -155,7 +155,8 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/harness.py \
   --data-mode synthetic \
   --dtype bfloat16 \
   --profile-memory-interval 1 \
-  --bandwidth-mode simulated \
+  --bandwidth-mode socket \
+  --socket-interface lo \
   --case-timeout-s 1800
 ```
 
@@ -171,7 +172,7 @@ Fast sweep variant:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/harness.py \
-  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json
+  --config experiments/configs/remote_4gpu_small_bandwidth_socket.json
 ```
 
 ### 3. Plot the Core Figures
@@ -405,26 +406,28 @@ Harness config files are JSON with two top-level objects:
 Example files:
 
 - `experiments/configs/remote_4gpu_bandwidth_smoke.json`
+- `experiments/configs/remote_4gpu_small_bandwidth_socket.json`
 - `experiments/configs/remote_4gpu_small_bandwidth_fast.json`
 - `experiments/configs/remote_4gpu_small_bandwidth_simulated.json`
 
 ## Bandwidth Modes
 
+- `socket`: forces NCCL onto `NET/Socket` over `lo` and shapes real socket traffic with the Linux `LD_PRELOAD` socket shaper
 - `simulated`: injects delay inside collective calls via `ZERO_SIM_BW_GBPS` and `ZERO_SIM_LATENCY_MS`
 - `tc`: calls `infra/throttle.sh apply` and `infra/throttle.sh delete` around each case
 - `none`: runs without bandwidth manipulation
 
-Use `simulated` for local single-host evaluation unless you have explicitly validated `tc` on a real multi-host path.
+Use `socket` for local single-host evaluation on Linux. Use `simulated` only as a fallback debugging mode. Use `tc` only after you have explicitly validated kernel-level shaping on a real multi-host path.
 
 ## Remote Single-Host Workflow
 
-When you have one multi-GPU machine and want a clean, repeatable simulated-bandwidth sweep, use the remote runner:
+When you have one multi-GPU machine and want a clean, repeatable bandwidth sweep, use the remote runner in socket mode:
 
 ```bash
 python3 experiments/run_remote_bandwidth_sweep.py \
   --host 184.144.213.79 \
   --port 40787 \
-  --config experiments/configs/remote_4gpu_small_bandwidth_fast.json \
+  --config experiments/configs/remote_4gpu_small_bandwidth_socket.json \
   --overwrite-local
 ```
 
@@ -440,8 +443,8 @@ Recommended sequence:
 
 1. Run `remote_4gpu_bandwidth_smoke.json` first.
 2. Inspect `bandwidth_report.md` and `throughput.png`.
-3. Run `remote_4gpu_small_bandwidth_fast.json` for the default main dataset.
-4. Use `remote_4gpu_small_bandwidth_simulated.json` only when you want the denser 7-point curve.
+3. Run `remote_4gpu_small_bandwidth_socket.json` for the default main dataset.
+4. Use `remote_4gpu_small_bandwidth_fast.json` or `remote_4gpu_small_bandwidth_simulated.json` only when you need a coarse debugging fallback.
 
 ## Idempotency And Launch Notes
 
