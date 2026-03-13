@@ -32,6 +32,12 @@ class CollectiveOps:
     def allreduce(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
         raise NotImplementedError
 
+    def allreduce_inplace(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
+        reduced = self.allreduce(tensor, average=average)
+        if reduced.data_ptr() != tensor.data_ptr():
+            tensor.copy_(reduced)
+        return tensor
+
     def reduce_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -48,6 +54,11 @@ class LocalCollectives(CollectiveOps):
         if average:
             out /= 1.0
         return out
+
+    def allreduce_inplace(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
+        if average:
+            tensor /= 1.0
+        return tensor
 
     def reduce_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.contiguous().view(-1).clone()
@@ -97,6 +108,17 @@ class TorchCollectives(CollectiveOps):
         if average:
             out /= dist.get_world_size()
         return out
+
+    def allreduce_inplace(self, tensor: torch.Tensor, average: bool = False) -> torch.Tensor:
+        dist.all_reduce(tensor)
+        _maybe_simulate_collective_delay(
+            num_bytes=tensor.numel() * tensor.element_size(),
+            world_size=dist.get_world_size(),
+        )
+        self._maybe_synchronize(tensor)
+        if average:
+            tensor /= dist.get_world_size()
+        return tensor
 
     def reduce_scatter(self, tensor: torch.Tensor) -> torch.Tensor:
         world_size = dist.get_world_size()

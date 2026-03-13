@@ -34,7 +34,9 @@ For the current experiment status, runbook, and remaining execution plan, read `
 - `train_zero.py --zero-stage 3` integration
 - `experiments/harness.py`: idempotent matrix runner for stage/model/bandwidth sweeps
 - `experiments/run_remote_bandwidth_sweep.py`: ship the current repo to an isolated remote workspace, run a sweep, sync results back, and generate plots + a markdown report
-- Linux socket-transport bandwidth shaping via `LD_PRELOAD` + forced NCCL `NET/Socket` on loopback
+- `experiments/run_fit_memory_bandwidth.py`: tune the largest per-stage microbatch under one GPU-memory budget, then sweep bandwidth with those tuned workloads
+- `experiments/run_remote_fit_memory_bandwidth.py`: remote wrapper for the fit-to-memory workflow
+- Linux socket-transport bandwidth shaping via `LD_PRELOAD` + forced NCCL `NET/Socket` on loopback, using a shared token bucket across all ranks in a case
 - Legacy collective-delay simulation mode for quick debugging (`ZERO_SIM_BW_GBPS`, `ZERO_SIM_LATENCY_MS`)
 - Optional `tc` throttling mode integration in harness
 - Per-case measured peak memory extraction + theoretical state-memory breakdown (params/grads/optimizer by stage)
@@ -148,6 +150,16 @@ python3 experiments/run_remote_bandwidth_sweep.py \
   --host 184.144.213.79 \
   --port 40787 \
   --config experiments/configs/remote_4gpu_small_bandwidth_socket.json \
+  --overwrite-local
+```
+
+Run the fit-to-memory experiment, which first tunes the largest per-stage microbatch under a fixed GPU-memory budget and then reruns the bandwidth sweep with those tuned microbatches:
+
+```bash
+python3 experiments/run_remote_fit_memory_bandwidth.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_fit_memory_socket.json \
   --overwrite-local
 ```
 

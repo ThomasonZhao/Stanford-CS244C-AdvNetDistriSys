@@ -43,6 +43,7 @@ class CaseConfig:
     seed: int
     dtype: str
     max_grad_norm: float
+    stage2_grad_bucket_mb: float
     profile_memory_interval: int
     metrics_warmup_steps: int
     bandwidth_mode: str
@@ -119,6 +120,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
     parser.add_argument("--max-grad-norm", type=float, default=0.0)
+    parser.add_argument(
+        "--stage2-grad-bucket-mb",
+        type=float,
+        default=64.0,
+        help="Approximate fp32 gradient bucket size for ZeRO stage 2 reduce-scatter bucketing.",
+    )
 
     parser.add_argument("--profile-memory-interval", type=int, default=0)
     parser.add_argument(
@@ -234,6 +241,7 @@ def _build_cases(args: argparse.Namespace) -> List[CaseConfig]:
                 seed=int(args.seed),
                 dtype=str(args.dtype),
                 max_grad_norm=float(args.max_grad_norm),
+                stage2_grad_bucket_mb=float(args.stage2_grad_bucket_mb),
                 profile_memory_interval=int(args.profile_memory_interval),
                 metrics_warmup_steps=int(args.metrics_warmup_steps),
                 bandwidth_mode=str(args.bandwidth_mode),
@@ -428,7 +436,11 @@ def _ensure_socket_shaper_built() -> Path:
     return SOCKET_SHAPER_SO
 
 
-def _build_launch_env(case: CaseConfig, socket_shaper_path: Path | None = None) -> Dict[str, str]:
+def _build_launch_env(
+    case: CaseConfig,
+    socket_shaper_path: Path | None = None,
+    socket_shaper_shared_name: str | None = None,
+) -> Dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.pop("ZERO_SIM_BW_GBPS", None)
@@ -436,6 +448,7 @@ def _build_launch_env(case: CaseConfig, socket_shaper_path: Path | None = None) 
     env.pop("ZERO_SOCKET_SHAPER_BW_GBPS", None)
     env.pop("ZERO_SOCKET_SHAPER_LATENCY_MS", None)
     env.pop("ZERO_SOCKET_SHAPER_BURST_BYTES", None)
+    env.pop("ZERO_SOCKET_SHAPER_SHARED_NAME", None)
 
     if case.bandwidth_mode == "simulated":
         if case.bandwidth_gbps > 0:
@@ -456,6 +469,8 @@ def _build_launch_env(case: CaseConfig, socket_shaper_path: Path | None = None) 
         if case.sim_latency_ms > 0:
             env["ZERO_SOCKET_SHAPER_LATENCY_MS"] = str(case.sim_latency_ms)
         env["ZERO_SOCKET_SHAPER_BURST_BYTES"] = str(case.socket_shaper_burst_bytes)
+        if socket_shaper_shared_name:
+            env["ZERO_SOCKET_SHAPER_SHARED_NAME"] = socket_shaper_shared_name
         env["NCCL_P2P_DISABLE"] = "1"
         env["NCCL_SHM_DISABLE"] = "1"
         env["NCCL_IB_DISABLE"] = "1"
@@ -516,6 +531,8 @@ def _build_train_zero_cmd(case: CaseConfig, profile_path: Path, launch: LaunchCo
         case.dtype,
         "--max-grad-norm",
         str(case.max_grad_norm),
+        "--stage2-grad-bucket-mb",
+        str(case.stage2_grad_bucket_mb),
         "--log-interval",
         "1",
         "--checkpoint-interval",
@@ -571,7 +588,12 @@ def _run_case(
     profile_path = profiles_dir / f"{case_id}.json"
     cmd = _build_train_zero_cmd(case=case, profile_path=profile_path, launch=launch, case_index=case_index)
     socket_shaper_path = _ensure_socket_shaper_built() if case.bandwidth_mode == "socket" else None
-    env = _build_launch_env(case, socket_shaper_path=socket_shaper_path)
+    socket_shaper_shared_name = f"zero_socket_{os.getpid()}_{case_index}"
+    env = _build_launch_env(
+        case,
+        socket_shaper_path=socket_shaper_path,
+        socket_shaper_shared_name=socket_shaper_shared_name if case.bandwidth_mode == "socket" else None,
+    )
     command_str = " ".join(shlex.quote(x) for x in cmd)
 
     if dry_run:

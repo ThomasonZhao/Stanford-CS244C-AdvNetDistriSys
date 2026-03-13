@@ -34,6 +34,7 @@ def _base_args() -> argparse.Namespace:
         seed=1337,
         dtype="float32",
         max_grad_norm=0.0,
+        stage2_grad_bucket_mb=64.0,
         profile_memory_interval=0,
         metrics_warmup_steps=0,
         bandwidth_mode="simulated",
@@ -273,6 +274,8 @@ def test_build_train_zero_cmd_uses_active_python_and_explicit_master() -> None:
     assert cmd[cmd.index("--master_addr") + 1] == "127.0.0.1"
     assert "--master_port" in cmd
     assert cmd[cmd.index("--master_port") + 1] == "29503"
+    assert "--stage2-grad-bucket-mb" in cmd
+    assert cmd[cmd.index("--stage2-grad-bucket-mb") + 1] == "64.0"
     assert str(harness.PROJECT_ROOT / "train_zero.py") in cmd
 
 
@@ -300,11 +303,16 @@ def test_build_launch_env_sets_socket_shaper_and_nccl_socket_transport() -> None
     case.bandwidth_mode = "socket"
     case.sim_latency_ms = 2.5
 
-    env = harness._build_launch_env(case, socket_shaper_path=Path("/tmp/socket_shaper.so"))
+    env = harness._build_launch_env(
+        case,
+        socket_shaper_path=Path("/tmp/socket_shaper.so"),
+        socket_shaper_shared_name="zero_socket_unit",
+    )
 
     assert env["ZERO_SOCKET_SHAPER_BW_GBPS"] == "5.0"
     assert env["ZERO_SOCKET_SHAPER_LATENCY_MS"] == "2.5"
     assert env["ZERO_SOCKET_SHAPER_BURST_BYTES"] == "262144"
+    assert env["ZERO_SOCKET_SHAPER_SHARED_NAME"] == "zero_socket_unit"
     assert env["NCCL_P2P_DISABLE"] == "1"
     assert env["NCCL_SHM_DISABLE"] == "1"
     assert env["NCCL_IB_DISABLE"] == "1"

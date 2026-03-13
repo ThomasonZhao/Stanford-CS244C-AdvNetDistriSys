@@ -16,6 +16,9 @@ class CaseView:
     stage: int
     model_size: str
     bandwidth_gbps: float
+    batch_size: int
+    grad_accum_steps: int
+    seq_len: int
     log_path: Path
     profile_path: Path | None
     mean_tokens_per_s: float | None
@@ -72,6 +75,21 @@ def _result_bandwidth(result: Dict[str, object]) -> float:
     return float(config.get("bandwidth_gbps", 0.0))
 
 
+def _result_batch_size(result: Dict[str, object]) -> int:
+    config = result.get("config", {})
+    return int(config.get("batch_size", 0))
+
+
+def _result_grad_accum_steps(result: Dict[str, object]) -> int:
+    config = result.get("config", {})
+    return int(config.get("grad_accum_steps", 1))
+
+
+def _result_seq_len(result: Dict[str, object]) -> int:
+    config = result.get("config", {})
+    return int(config.get("seq_len", 0))
+
+
 def _result_log_path(result: Dict[str, object]) -> Path:
     if "log_path" in result:
         return Path(str(result["log_path"]))
@@ -120,6 +138,9 @@ def parse_summary(summary_path: Path) -> List[CaseView]:
                 stage=_result_stage(result),
                 model_size=_result_model_size(result),
                 bandwidth_gbps=_result_bandwidth(result),
+                batch_size=_result_batch_size(result),
+                grad_accum_steps=_result_grad_accum_steps(result),
+                seq_len=_result_seq_len(result),
                 log_path=raw_log_path,
                 profile_path=raw_profile_path,
                 mean_tokens_per_s=_as_optional_float(result.get("mean_tokens_per_s")),

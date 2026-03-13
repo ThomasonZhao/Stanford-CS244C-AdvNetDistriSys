@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -10,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -37,9 +40,19 @@ typedef struct {
     double tokens;
     double last_refill_s;
     pthread_mutex_t mu;
-} shaper_state_t;
+} token_bucket_state_t;
 
-static shaper_state_t g_state = {
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    volatile uint32_t initialized;
+    token_bucket_state_t state;
+} shared_shaper_state_t;
+
+#define SHAPER_MAGIC 0x53485052u
+#define SHAPER_VERSION 1u
+
+static token_bucket_state_t g_local_state = {
     .enabled = 0,
     .rate_bytes_per_s = 0.0,
     .latency_s = 0.0,
@@ -48,6 +61,8 @@ static shaper_state_t g_state = {
     .last_refill_s = 0.0,
     .mu = PTHREAD_MUTEX_INITIALIZER,
 };
+static token_bucket_state_t *g_state = &g_local_state;
+static shared_shaper_state_t *g_shared_state = NULL;
 
 static double monotonic_seconds(void) {
     struct timespec ts;
@@ -84,6 +99,120 @@ static double getenv_double(const char *name, double fallback) {
         return fallback;
     }
     return strtod(value, NULL);
+}
+
+static int lock_token_bucket(token_bucket_state_t *state) {
+    int rc = pthread_mutex_lock(&state->mu);
+#ifdef PTHREAD_MUTEX_ROBUST
+    if (rc == EOWNERDEAD) {
+        pthread_mutex_consistent(&state->mu);
+        rc = 0;
+    }
+#endif
+    return rc;
+}
+
+static void configure_token_bucket(token_bucket_state_t *state, double bandwidth_gbps, double latency_ms, double burst_bytes) {
+    state->enabled = (bandwidth_gbps > 0.0) || (latency_ms > 0.0);
+    state->rate_bytes_per_s = bandwidth_gbps > 0.0 ? bandwidth_gbps * 1e9 : 0.0;
+    state->latency_s = latency_ms > 0.0 ? latency_ms / 1000.0 : 0.0;
+    state->burst_bytes = burst_bytes > 0.0 ? burst_bytes : 262144.0;
+    state->tokens = state->burst_bytes;
+    state->last_refill_s = monotonic_seconds();
+}
+
+static int build_shared_name(const char *raw_name, char *buffer, size_t size) {
+    if (raw_name == NULL || raw_name[0] == '\0' || size < 2) {
+        return 0;
+    }
+    if (raw_name[0] == '/') {
+        if (snprintf(buffer, size, "%s", raw_name) >= (int)size) {
+            return 0;
+        }
+        return 1;
+    }
+    if (snprintf(buffer, size, "/%s", raw_name) >= (int)size) {
+        return 0;
+    }
+    return 1;
+}
+
+static shared_shaper_state_t *open_shared_state(
+    const char *raw_name,
+    double bandwidth_gbps,
+    double latency_ms,
+    double burst_bytes
+) {
+    char shared_name[256];
+    if (!build_shared_name(raw_name, shared_name, sizeof(shared_name))) {
+        return NULL;
+    }
+
+    int created = 0;
+    int fd = shm_open(shared_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+        created = 1;
+        if (ftruncate(fd, (off_t)sizeof(shared_shaper_state_t)) != 0) {
+            close(fd);
+            shm_unlink(shared_name);
+            return NULL;
+        }
+    } else if (errno == EEXIST) {
+        fd = shm_open(shared_name, O_RDWR, 0600);
+    }
+
+    if (fd < 0) {
+        return NULL;
+    }
+
+    void *mapping = mmap(NULL, sizeof(shared_shaper_state_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (mapping == MAP_FAILED) {
+        if (created) {
+            shm_unlink(shared_name);
+        }
+        return NULL;
+    }
+
+    shared_shaper_state_t *shared = (shared_shaper_state_t *)mapping;
+    if (created) {
+        memset(shared, 0, sizeof(*shared));
+
+        pthread_mutexattr_t attr;
+        if (pthread_mutexattr_init(&attr) != 0) {
+            munmap(mapping, sizeof(shared_shaper_state_t));
+            shm_unlink(shared_name);
+            return NULL;
+        }
+        pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+#ifdef PTHREAD_MUTEX_ROBUST
+        pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+#endif
+        if (pthread_mutex_init(&shared->state.mu, &attr) != 0) {
+            pthread_mutexattr_destroy(&attr);
+            munmap(mapping, sizeof(shared_shaper_state_t));
+            shm_unlink(shared_name);
+            return NULL;
+        }
+        pthread_mutexattr_destroy(&attr);
+
+        shared->magic = SHAPER_MAGIC;
+        shared->version = SHAPER_VERSION;
+        configure_token_bucket(&shared->state, bandwidth_gbps, latency_ms, burst_bytes);
+        __sync_synchronize();
+        shared->initialized = 1;
+    } else {
+        for (int attempt = 0; attempt < 5000 && !shared->initialized; attempt++) {
+            sleep_seconds(0.001);
+        }
+        if (!shared->initialized || shared->magic != SHAPER_MAGIC || shared->version != SHAPER_VERSION) {
+            munmap(mapping, sizeof(shared_shaper_state_t));
+            return NULL;
+        }
+    }
+
+    g_shared_state = shared;
+    return shared;
 }
 
 static void load_real_symbols(void) {
@@ -129,7 +258,8 @@ static int is_inet_socket_fd(int fd) {
 }
 
 static void maybe_shape_send(int fd, size_t num_bytes) {
-    if (!g_state.enabled || num_bytes == 0) {
+    token_bucket_state_t *state = g_state;
+    if (!state->enabled || num_bytes == 0) {
         return;
     }
     if (!is_inet_socket_fd(fd)) {
@@ -137,35 +267,37 @@ static void maybe_shape_send(int fd, size_t num_bytes) {
     }
 
     double bandwidth_sleep_s = 0.0;
-    pthread_mutex_lock(&g_state.mu);
+    if (lock_token_bucket(state) != 0) {
+        return;
+    }
 
-    if (g_state.rate_bytes_per_s > 0.0) {
+    if (state->rate_bytes_per_s > 0.0) {
         double now_s = monotonic_seconds();
-        if (g_state.last_refill_s <= 0.0) {
-            g_state.last_refill_s = now_s;
-            g_state.tokens = g_state.burst_bytes;
+        if (state->last_refill_s <= 0.0) {
+            state->last_refill_s = now_s;
+            state->tokens = state->burst_bytes;
         }
 
-        if (now_s > g_state.last_refill_s) {
-            g_state.tokens += (now_s - g_state.last_refill_s) * g_state.rate_bytes_per_s;
-            if (g_state.tokens > g_state.burst_bytes) {
-                g_state.tokens = g_state.burst_bytes;
+        if (now_s > state->last_refill_s) {
+            state->tokens += (now_s - state->last_refill_s) * state->rate_bytes_per_s;
+            if (state->tokens > state->burst_bytes) {
+                state->tokens = state->burst_bytes;
             }
-            g_state.last_refill_s = now_s;
+            state->last_refill_s = now_s;
         }
 
-        if ((double)num_bytes <= g_state.tokens) {
-            g_state.tokens -= (double)num_bytes;
+        if ((double)num_bytes <= state->tokens) {
+            state->tokens -= (double)num_bytes;
         } else {
-            double deficit_bytes = (double)num_bytes - g_state.tokens;
-            g_state.tokens = 0.0;
-            bandwidth_sleep_s = deficit_bytes / g_state.rate_bytes_per_s;
-            g_state.last_refill_s = now_s + bandwidth_sleep_s;
+            double deficit_bytes = (double)num_bytes - state->tokens;
+            state->tokens = 0.0;
+            bandwidth_sleep_s = deficit_bytes / state->rate_bytes_per_s;
+            state->last_refill_s = now_s + bandwidth_sleep_s;
         }
     }
 
-    double latency_sleep_s = g_state.latency_s;
-    pthread_mutex_unlock(&g_state.mu);
+    double latency_sleep_s = state->latency_s;
+    pthread_mutex_unlock(&state->mu);
 
     if (latency_sleep_s > 0.0) {
         sleep_seconds(latency_sleep_s);
@@ -189,13 +321,17 @@ __attribute__((constructor)) static void init_socket_shaper(void) {
     double bandwidth_gbps = getenv_double("ZERO_SOCKET_SHAPER_BW_GBPS", 0.0);
     double latency_ms = getenv_double("ZERO_SOCKET_SHAPER_LATENCY_MS", 0.0);
     double burst_bytes = getenv_double("ZERO_SOCKET_SHAPER_BURST_BYTES", 262144.0);
+    const char *shared_name = getenv("ZERO_SOCKET_SHAPER_SHARED_NAME");
 
-    g_state.enabled = (bandwidth_gbps > 0.0) || (latency_ms > 0.0);
-    g_state.rate_bytes_per_s = bandwidth_gbps > 0.0 ? bandwidth_gbps * 1e9 : 0.0;
-    g_state.latency_s = latency_ms > 0.0 ? latency_ms / 1000.0 : 0.0;
-    g_state.burst_bytes = burst_bytes > 0.0 ? burst_bytes : 262144.0;
-    g_state.tokens = g_state.burst_bytes;
-    g_state.last_refill_s = monotonic_seconds();
+    if (shared_name != NULL && shared_name[0] != '\0') {
+        shared_shaper_state_t *shared = open_shared_state(shared_name, bandwidth_gbps, latency_ms, burst_bytes);
+        if (shared != NULL) {
+            g_state = &shared->state;
+            return;
+        }
+    }
+
+    configure_token_bucket(&g_local_state, bandwidth_gbps, latency_ms, burst_bytes);
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags) {

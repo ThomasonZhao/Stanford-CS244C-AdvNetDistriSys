@@ -56,7 +56,7 @@ Every harness run writes to `experiments/results/<name>/`:
 
 The remote runner writes the pulled run under `experiments/results/remote/<host>/<name>/` and also generates:
 
-- `bandwidth_report.md`: compact markdown summary of best stage by bandwidth and per-stage slowdown
+- `bandwidth_report.md`: markdown report with methodology, stage ranking by bandwidth, throughput/communication tables, and fit-to-memory tuning details when present
 - `remote_run_metadata.json`: remote workspace, config, host, and sync metadata
 - plot files such as `throughput.png`, `comm.png`, `tflops.png`, `stage_throughput.png`, and `stage_comm.png`
 
@@ -82,7 +82,7 @@ The main metrics in this repo are:
 
 For bandwidth sweeps, use `--metrics-warmup-steps 1` or higher so mean throughput and communication exclude allocator and CUDA startup noise from step 1.
 
-On a single Linux multi-GPU machine, prefer `bandwidth-mode=socket`. It forces NCCL onto `NET/Socket` over `lo`, injects shaping below the collective layer through an `LD_PRELOAD` socket shaper, and keeps the bandwidth experiment tied to real socket traffic instead of collective-specific delay formulas.
+On a single Linux multi-GPU machine, prefer `bandwidth-mode=socket`. It forces NCCL onto `NET/Socket` over `lo`, injects shaping below the collective layer through an `LD_PRELOAD` socket shaper, and keeps the bandwidth experiment tied to real socket traffic instead of collective-specific delay formulas. The shaper now uses a shared token bucket across all ranks in a case, so the configured bandwidth behaves like one shared link instead of one cap per process.
 
 Use `experiments/configs/remote_4gpu_small_bandwidth_socket.json` as the default single-host bandwidth sweep. It keeps only the useful bandwidth points around the knee (`0, 1, 2, 5, 10 Gbps`) and uses `12` steps with `2` warmup steps. The older `remote_4gpu_small_bandwidth_fast.json` and `remote_4gpu_small_bandwidth_simulated.json` configs are only for coarse debugging when socket shaping is unavailable.
 
@@ -163,7 +163,7 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/harness.py \
 Expected pattern:
 
 - memory ordering should be `stage 0 > stage 1 > stage 2 > stage 3`
-- lower bandwidth should hurt stage 3 the most
+- communication-sensitive stages should lose throughput as bandwidth drops
 - communication time should rise as bandwidth drops
 
 If the pattern is missing, debug before doing more runs.
@@ -407,12 +407,14 @@ Example files:
 
 - `experiments/configs/remote_4gpu_bandwidth_smoke.json`
 - `experiments/configs/remote_4gpu_small_bandwidth_socket.json`
+- `experiments/configs/remote_4gpu_small_fit_memory_socket.json`
+- `experiments/configs/remote_4gpu_medium_fit_memory_socket.json`
 - `experiments/configs/remote_4gpu_small_bandwidth_fast.json`
 - `experiments/configs/remote_4gpu_small_bandwidth_simulated.json`
 
 ## Bandwidth Modes
 
-- `socket`: forces NCCL onto `NET/Socket` over `lo` and shapes real socket traffic with the Linux `LD_PRELOAD` socket shaper
+- `socket`: forces NCCL onto `NET/Socket` over `lo` and shapes real socket traffic with the Linux `LD_PRELOAD` socket shaper, using one shared bandwidth bucket across all ranks in the case
 - `simulated`: injects delay inside collective calls via `ZERO_SIM_BW_GBPS` and `ZERO_SIM_LATENCY_MS`
 - `tc`: calls `infra/throttle.sh apply` and `infra/throttle.sh delete` around each case
 - `none`: runs without bandwidth manipulation
@@ -445,6 +447,31 @@ Recommended sequence:
 2. Inspect `bandwidth_report.md` and `throughput.png`.
 3. Run `remote_4gpu_small_bandwidth_socket.json` for the default main dataset.
 4. Use `remote_4gpu_small_bandwidth_fast.json` or `remote_4gpu_small_bandwidth_simulated.json` only when you need a coarse debugging fallback.
+
+## Fit-To-Memory Workflow
+
+Use this when the question is not "which stage has less communication for the same workload?" but "what throughput can each stage buy if it is allowed to spend its memory savings on a larger microbatch?"
+
+```bash
+python3 experiments/run_remote_fit_memory_bandwidth.py \
+  --host 184.144.213.79 \
+  --port 40787 \
+  --config experiments/configs/remote_4gpu_small_fit_memory_socket.json \
+  --overwrite-local
+```
+
+What it does:
+
+- computes one fixed per-GPU memory budget, defaulting to 90% of the smallest visible GPU memory
+- tunes the largest per-stage microbatch that stays within that budget using measured peak reserved CUDA memory
+- writes `tuning_summary.json` with every tuning trial plus the selected microbatch per stage
+- reruns the socket bandwidth sweep with those tuned microbatches
+- pulls the finished run back locally and regenerates plots plus `bandwidth_report.md`
+
+Use the fixed-workload sweep and fit-to-memory sweep together:
+
+1. Fixed-workload sweep: isolates communication tradeoffs by keeping the workload the same across stages.
+2. Fit-to-memory sweep: measures the practical throughput benefit of ZeRO memory savings when each stage can scale microbatch up to the same memory budget.
 
 ## Idempotency And Launch Notes
 
