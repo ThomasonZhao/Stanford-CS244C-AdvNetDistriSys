@@ -66,9 +66,9 @@ blue = "#8FA2D2"
 orange = "#E7AE7A"
 green = "#9FC98B"
 linec = "#6E88D0"
-bg = "#F4F4F4"
+bg = "#FFFFFF"
 
-fig, ax = plt.subplots(figsize=(14, 6.5), dpi=200)
+fig, ax = plt.subplots(figsize=(12, 6), dpi=200)
 fig.patch.set_facecolor(bg)
 ax.set_facecolor(bg)
 ax.set_xlim(0, 100)
@@ -85,25 +85,25 @@ for y in row_lines[1:]:
 for x in [x_label_div, x_formula_div, x_value_div]:
     ax.plot([x, x], [6, 96], color=linec, lw=0.8)
 
-ax.text(19, 86, r"$\mathrm{GPU}_{0}$", fontsize=24, ha="center", va="center")
-ax.text(41, 86, r"$\mathrm{GPU}_{i}$", fontsize=24, ha="center", va="center")
-ax.text(63, 86, r"$\mathrm{GPU}_{N-1}$", fontsize=24, ha="center", va="center")
-ax.text(81, 90, "Memory\nConsumed", fontsize=24, ha="center", va="center")
-ax.text(93.6, 91, f"K={K}\nΨ={psi_label}\nN$_d$={N_D}", fontsize=16, ha="center", va="center")
+ax.text(19, 86, r"$\mathrm{GPU}_{0}$", fontsize=20, ha="center", va="center")
+ax.text(41, 86, r"$\mathrm{GPU}_{i}$", fontsize=20, ha="center", va="center")
+ax.text(63, 86, r"$\mathrm{GPU}_{N-1}$", fontsize=20, ha="center", va="center")
+ax.text(81, 90, "Memory\nConsumed", fontsize=20, ha="center", va="center")
+ax.text(93.6, 91, f"K={K}\nΨ={psi_label}\nN$_d$={N_D}", fontsize=12, ha="center", va="center")
 
-ax.text(4.4, 74.5, "Baseline", fontsize=24, ha="center", va="center")
-ax.text(4.0, 56, r"$\mathrm{P}_{\mathrm{os}}$", fontsize=24, ha="center", va="center")
-ax.text(4.3, 38, r"$\mathrm{P}_{\mathrm{os{+}g}}$", fontsize=24, ha="center", va="center")
-ax.text(4.6, 20, r"$\mathrm{P}_{\mathrm{os{+}g{+}p}}$", fontsize=24, ha="center", va="center")
+ax.text(4.4, 74.5, "Baseline", fontsize=20, ha="center", va="center")
+ax.text(4.0, 56, r"$\mathrm{P}_{\mathrm{os}}$", fontsize=20, ha="center", va="center")
+ax.text(4.3, 38, r"$\mathrm{P}_{\mathrm{os{+}g}}$", fontsize=20, ha="center", va="center")
+ax.text(4.6, 20, r"$\mathrm{P}_{\mathrm{os{+}g{+}p}}$", fontsize=20, ha="center", va="center")
 
-ax.text(81, 73, r"$(2 + 2 + K)\,*\,\Psi$", fontsize=24, ha="center", va="center")
-ax.text(94, 73, _format_gb(baseline_bytes), fontsize=18, ha="center", va="center")
-ax.text(81, 56, r"$2\Psi\,+\,2\Psi\,+\,\frac{K\,*\,\Psi}{N_d}$", fontsize=24, ha="center", va="center")
-ax.text(94, 56, _format_gb(os_bytes), fontsize=18, ha="center", va="center")
-ax.text(81, 38, r"$2\Psi\,+\,\frac{(2{+}K)*\Psi}{N_d}$", fontsize=24, ha="center", va="center")
-ax.text(94, 38, _format_gb(osg_bytes), fontsize=18, ha="center", va="center")
-ax.text(81, 20, r"$\frac{(2 + 2 + K)*\Psi}{N_d}$", fontsize=24, ha="center", va="center")
-ax.text(94, 20, _format_gb(osgp_bytes), fontsize=18, ha="center", va="center")
+ax.text(81, 73, r"$(2 + 2 + K)\,*\,\Psi$", fontsize=20, ha="center", va="center")
+ax.text(94, 73, _format_gb(baseline_bytes), fontsize=16, ha="center", va="center")
+ax.text(81, 56, r"$2\Psi\,+\,2\Psi\,+\,\frac{K\,*\,\Psi}{N_d}$", fontsize=20, ha="center", va="center")
+ax.text(94, 56, _format_gb(os_bytes), fontsize=16, ha="center", va="center")
+ax.text(81, 38, r"$2\Psi\,+\,\frac{(2{+}K)*\Psi}{N_d}$", fontsize=20, ha="center", va="center")
+ax.text(94, 38, _format_gb(osg_bytes), fontsize=16, ha="center", va="center")
+ax.text(81, 20, r"$\frac{(2 + 2 + K)*\Psi}{N_d}$", fontsize=20, ha="center", va="center")
+ax.text(94, 20, _format_gb(osgp_bytes), fontsize=16, ha="center", va="center")
 
 def draw_baseline(x, y, w=16, h_opt=9, h_grad=1.3, h_param=1.3):
     ax.add_patch(Rectangle((x, y), w, h_opt, facecolor=green, edgecolor="none"))
@@ -147,7 +147,12 @@ legend_y = 2.5
 legend_items = [("Parameters", blue, 14), ("Gradients", orange, 38), ("Optimizer States", green, 60)]
 for label, color, x in legend_items:
     ax.add_patch(Rectangle((x, legend_y - 0.8), 2.2, 3.2, facecolor=color, edgecolor="none"))
-    ax.text(x + 3.0, legend_y + 0.7, label, fontsize=24, ha="left", va="center")
+    ax.text(x + 3.0, legend_y + 0.7, label, fontsize=18, ha="left", va="center")
 
 plt.tight_layout(pad=0.15)
-fig.savefig("memory_parallelism_diagram.pdf", bbox_inches="tight", facecolor=fig.get_facecolor())
+fig.savefig(
+    "memory_parallelism_diagram.pdf",
+    bbox_inches="tight",
+    facecolor=bg,
+    transparent=False,
+)

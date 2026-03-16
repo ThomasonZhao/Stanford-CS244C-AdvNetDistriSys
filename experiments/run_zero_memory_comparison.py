@@ -1,30 +1,33 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import List
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_ROOT = PROJECT_ROOT / "experiments" / "results"
 
 DEFAULT_MODEL_SIZE = "small"
-DEFAULT_SEQ_LEN = 512
-DEFAULT_BATCH_SIZE = 44
+DEFAULT_SEQ_LEN = 256
+DEFAULT_BATCH_SIZE = 92
 DEFAULT_GRAD_ACCUM_STEPS = 1
 DEFAULT_STEPS = 20
 DEFAULT_DTYPE = "bfloat16"
 DEFAULT_MEASURE_MEMORY_STEP = True
 
 
-def parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a ZeRO stage memory comparison sweep")
+    parser.add_argument("--config", type=str, default="")
     parser.add_argument(
         "--name",
         type=str,
-        default="memory_comparison",
-        help="Optional run name. If omitted, use the project memory-comparison preset name.",
+        default="",
+        help="Optional run name. If omitted, generate one from the workload settings.",
     )
     parser.add_argument("--results-dir", type=str, default=str(RESULTS_ROOT))
     parser.add_argument("--model-size", type=str, default=DEFAULT_MODEL_SIZE, choices=["tiny", "small", "medium"])
@@ -52,8 +55,20 @@ def parse_args() -> argparse.Namespace:
         help="If omitted, use steps - 1 when measured-step mode is enabled.",
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    parser = _build_parser()
+    preliminary_args, _ = parser.parse_known_args(argv)
+    if preliminary_args.config:
+        payload = json.loads(Path(preliminary_args.config).read_text())
+        defaults = payload.get("defaults", {})
+        if isinstance(defaults, dict):
+            parser.set_defaults(**defaults)
+    return parser.parse_args(argv)
 
 
 def detect_visible_gpus() -> int:
@@ -174,6 +189,9 @@ def main() -> None:
 
     if args.dry_run:
         print("[memory-sweep] dry run complete; skipping plot generation", flush=True)
+        return
+    if args.skip_plots:
+        print("[memory-sweep] run complete; skipping plot generation", flush=True)
         return
 
     memory_plot_cmd = [
