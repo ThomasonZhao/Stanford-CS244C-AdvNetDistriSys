@@ -491,36 +491,88 @@ def plot_bandwidth_metric(cases: List[CaseView], metric: str, output: Path) -> N
     for case in cases:
         by_stage.setdefault(case.stage, []).append(case)
 
-    plt.figure(figsize=(8, 5))
+    finite_bandwidths = sorted({case.bandwidth_gbps for case in cases if case.bandwidth_gbps > 0.0})
+    include_unlimited = any(case.bandwidth_gbps <= 0.0 for case in cases)
+    include_zero_origin = metric in {"throughput", "tflops"}
+
+    if include_unlimited:
+        fig, (ax, ax_inf) = plt.subplots(
+            1,
+            2,
+            sharey=True,
+            figsize=(10, 5),
+            gridspec_kw={"width_ratios": [8, 1], "wspace": 0.05},
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax_inf = None
+
     plotted = 0
     for stage in sorted(by_stage):
-        stage_cases = sorted(by_stage[stage], key=lambda c: c.bandwidth_gbps)
-        xs: List[float] = []
-        ys: List[float] = []
+        stage_cases = sorted(
+            by_stage[stage],
+            key=lambda c: (1 if c.bandwidth_gbps <= 0.0 else 0, c.bandwidth_gbps),
+        )
+        finite_xs: List[float] = [0.0] if include_zero_origin else []
+        finite_ys: List[float] = [0.0] if include_zero_origin else []
+        saw_real_point = False
+        unlimited_value: float | None = None
         for case in stage_cases:
             if case.return_code != 0:
                 continue
             val = getattr(case, key)
             if val is None:
                 continue
-            xs.append(case.bandwidth_gbps)
-            ys.append(val)
-        if not xs:
+            if case.bandwidth_gbps <= 0.0:
+                unlimited_value = val
+                saw_real_point = True
+                continue
+            finite_xs.append(case.bandwidth_gbps)
+            finite_ys.append(val)
+            saw_real_point = True
+        if not saw_real_point:
             continue
-        plt.plot(xs, ys, marker="o", linewidth=2, label=f"stage {stage}")
+        line = ax.plot(finite_xs, finite_ys, marker="o", linewidth=2, label=f"stage {stage}")[0]
+        if ax_inf is not None and unlimited_value is not None:
+            ax_inf.plot([0.0], [unlimited_value], marker="o", linestyle="None", color=line.get_color())
         plotted += 1
 
     if plotted == 0:
         raise RuntimeError(f"No data points available for metric '{metric}'")
 
-    plt.xlabel("Bandwidth limit (Gbps, 0 means unlimited/no simulation)")
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
+    if finite_bandwidths:
+        finite_ticks = [0.0] + finite_bandwidths if include_zero_origin else finite_bandwidths
+        ax.set_xticks(finite_ticks)
+        ax.set_xlim(min(finite_ticks), max(finite_ticks))
+    ax.set_xlabel("Bandwidth limit (Gbps)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    if ax_inf is not None:
+        ax_inf.set_xlim(-0.5, 0.5)
+        ax_inf.set_xticks([0.0])
+        ax_inf.set_xticklabels(["inf"])
+        ax_inf.grid(True, axis="y", alpha=0.3)
+        ax_inf.tick_params(axis="y", left=False, labelleft=False)
+        ax.spines["right"].set_visible(False)
+        ax_inf.spines["left"].set_visible(False)
+
+        d = 0.015
+        kwargs = dict(transform=ax.transAxes, color="k", clip_on=False, linewidth=1.0)
+        ax.plot((1 - d, 1 + d), (-d, +d), **kwargs)
+        ax.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs)
+        kwargs = dict(transform=ax_inf.transAxes, color="k", clip_on=False, linewidth=1.0)
+        ax_inf.plot((-d, +d), (-d, +d), **kwargs)
+        ax_inf.plot((-d, +d), (1 - d, 1 + d), **kwargs)
+
     output.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(output)
+    if ax_inf is not None:
+        fig.subplots_adjust(left=0.09, right=0.98, bottom=0.14, top=0.90, wspace=0.05)
+    else:
+        fig.tight_layout()
+    fig.savefig(output)
 
 
 def plot_stage_metric(cases: List[CaseView], metric: str, output: Path) -> None:

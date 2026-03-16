@@ -140,8 +140,24 @@ def plot_figure(points: List[Dict[str, object]], output: Path, baseline_gpu_coun
     fig, ax_total = plt.subplots(figsize=(9.2, 5.6))
     ax_gpu = ax_total.twinx()
 
-    ax_gpu.bar(xs, per_gpu, width=0.46, color="#d0d0d0", edgecolor="#a8a8a8", label="Performance/GPU (TFLOPs)")
-    ax_total.plot(xs, observed, color="#1b9e77", marker="o", linewidth=2.4, label="Observed Performance (TFLOPs)")
+    ax_gpu.bar(
+        xs,
+        per_gpu,
+        width=0.46,
+        color="#d0d0d0",
+        edgecolor="#a8a8a8",
+        label="Performance/GPU (TFLOPs)",
+        zorder=1,
+    )
+    ax_total.plot(
+        xs,
+        observed,
+        color="#1b9e77",
+        marker="o",
+        linewidth=2.4,
+        label="Observed Performance (TFLOPs)",
+        zorder=4,
+    )
     ax_total.plot(
         xs,
         perfect_linear,
@@ -149,6 +165,7 @@ def plot_figure(points: List[Dict[str, object]], output: Path, baseline_gpu_coun
         marker="o",
         linewidth=2.0,
         label="Perfect Linear Scalability (TFLOPs)",
+        zorder=3,
     )
 
     ax_total.set_xticks(xs)
@@ -157,7 +174,10 @@ def plot_figure(points: List[Dict[str, object]], output: Path, baseline_gpu_coun
     ax_total.set_ylabel("Total Performance (TFLOPs)")
     ax_gpu.set_ylabel("Performance/GPU (TFLOPs)")
     ax_total.grid(axis="y", linestyle="--", alpha=0.3)
-    ax_total.set_title(f"Stage 3 Scaling (baseline {baseline_gpu_count} GPU)")
+    ax_total.set_title(f"ZeRO Scaling (baseline {baseline_gpu_count} GPU)")
+    ax_total.set_zorder(3)
+    ax_gpu.set_zorder(2)
+    ax_total.patch.set_alpha(0.0)
 
     handles_total, labels_total = ax_total.get_legend_handles_labels()
     handles_gpu, labels_gpu = ax_gpu.get_legend_handles_labels()
